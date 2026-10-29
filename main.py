@@ -12,15 +12,32 @@ import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pystray
+from PIL import Image
 
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
 from ui_sync import set_chests_hidden, reload_game_ui, ensure_webview2_cdp_env
 
-VERSION = '1.0.0'
+VERSION = '1.0.2'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
+
+def resource_path(name):
+    """Find bundled resources in source runs and PyInstaller one-directory builds."""
+    candidates = []
+    frozen_root = getattr(sys, '_MEIPASS', None)
+    if frozen_root:
+        candidates.append(Path(frozen_root) / name)
+    source_dir = Path(__file__).resolve().parent
+    candidates.extend((source_dir / name, source_dir.parent / name))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f'Bundled resource not found: {name}')
 
 def write_config(enabled):
     CONFIG_FILE.write_text(json.dumps({'enabled': bool(enabled)}), encoding='utf8')
@@ -51,11 +68,6 @@ def configure_log():
 
 class TrayApp:
     def __init__(self, enabled=False, minimized=False):
-        import tkinter as tk
-        from tkinter import ttk
-        import pystray
-        from PIL import Image, ImageDraw
-        self.tk, self.ttk = tk, ttk
         self.log = configure_log()
         self.messages = queue.Queue()
         self.exit_event, self.wake = threading.Event(), threading.Event()
@@ -72,6 +84,8 @@ class TrayApp:
         self.stopping = False
         self.root = tk.Tk()
         self.root.title('Wuwa Tappo • Chest Auto-Claim')
+        self.window_icon = tk.PhotoImage(file=str(resource_path('Zani.png')))
+        self.root.iconphoto(True, self.window_icon)
         self.root.geometry('600x540')
         self.root.minsize(560, 540)
         self.root.configure(bg='#121b2a')
@@ -122,14 +136,11 @@ class TrayApp:
         
         ttk.Label(frame, text='Keep Wuwa Tappo running. Never changes system time or fabricates clicks.\nClosing this window minimizes to the system tray.', style='Muted.TLabel').pack(anchor='w', pady=(12, 0))
         
-        icon = Image.new('RGBA', (64, 64), '#142335')
-        d = ImageDraw.Draw(icon)
-        d.rounded_rectangle((8, 20, 56, 51), radius=6, fill='#51c6ab', outline='#d9f7f0', width=2)
-        d.line((8, 31, 56, 31), fill='#142335', width=3)
-        d.rounded_rectangle((28, 27, 36, 39), radius=2, fill='#f5cc71')
+        self.tray_icon_image = Image.open(resource_path('Zani.png')).convert('RGBA')
+        self.tray_icon_image.thumbnail((64, 64), Image.Resampling.LANCZOS)
         
         self.tray = pystray.Icon(
-            'WuwaTappoAutoClaim', icon, 'Wuwa Tappo • Chest Auto-Claim',
+            'WuwaTappoAutoClaim', self.tray_icon_image, 'Wuwa Tappo • Chest Auto-Claim',
             menu=pystray.Menu(
                 pystray.MenuItem('Open Dashboard', lambda *_: self.messages.put(('show', {})), default=True),
                 pystray.MenuItem('Enable / Pause', lambda *_: self.messages.put(('toggle', {}))),
@@ -194,6 +205,9 @@ class TrayApp:
     def show(self):
         self.root.deiconify()
         self.root.lift()
+        self.root.attributes('-topmost', True)
+        self.root.after_idle(self.root.attributes, '-topmost', False)
+        self.root.focus_force()
 
     def pair(self):
         if self.pairing or self.stopping:
@@ -454,5 +468,7 @@ if __name__ == '__main__':
         sys.exit(main())
     except Exception as exc:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        (DATA_DIR / 'startup-error.txt').write_text('Startup error: ' + type(exc).__name__, encoding='utf8')
+        import traceback
+        (DATA_DIR / 'startup-error.txt').write_text(traceback.format_exc(), encoding='utf8')
         sys.exit(1)
+
