@@ -24,7 +24,7 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.0.zip`.
+1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.1.zip`.
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
