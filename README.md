@@ -11,6 +11,7 @@ An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after th
 - Waits for the server deadline, then sends one claim request for a ready chest when at least 1,000 server-recorded clicks are available.
 - Processes the two chest slots one at a time and records outcomes locally to avoid repeating a successful claim.
 - Shows countdowns and status in a small Windows tray app. You can pause, resume, inspect the activity log, or exit.
+- Hides chest controls while auto-claim is active and reloads the Tappo page after a claim so the displayed click balance refreshes.
 - Uses the server's response time and a monotonic timer, so changing the Windows clock does not make a chest ready sooner.
 
 The service remains authoritative. It may reject a claim during cooldown, after a session expires, or when the server has not recorded enough clicks. The helper backs off and checks again. It polls at intervals of up to about 30 seconds, so a claim can happen a few seconds later than the exact deadline.
@@ -24,11 +25,11 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.2.zip`.
+1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.3.zip`.
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
-5. Choose **Enable Auto-Claim**. Close or minimize the dashboard to keep the helper in the notification area.
+5. Choose **Enable Auto-Claim**. If UI sync is unavailable, approve the one-time prompt or click **Restart Tappo for UI sync**; the helper waits for pending clicks to save, then restarts Tappo with the WebView2 setting needed to hide chests and refresh the click display. Close or minimize the dashboard to keep the helper in the notification area.
 
 You can instead run `Run-Background.vbs` to start minimized with auto-claim enabled. Use **Exit** in the tray menu or `Stop-Tool.vbs` to stop it. It is not added to Windows Startup or Task Scheduler; launch it again after a Windows restart.
 
@@ -40,7 +41,7 @@ Wuwa Tappo's service creates a chest after its 30-minute active-time cycle. Clai
 
 The helper reads only the `kuro_infoToken` session cookie in Wuwa Tappo's own WebView2 profile when you choose to pair. It does not read Chrome, Edge, or Firefox profiles and does not store your password. The saved session is protected with Windows DPAPI for the current Windows account. API requests go to the Wuwa Tappo service configured in the source; logs omit session tokens and authorization headers. Tool data is stored under `%LOCALAPPDATA%\WuwaTappoAutoClaim`.
 
-**WebView2 debugging notice:** To hide and restore the chest controls in the Wuwa Tappo window, the helper sets the per-user `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable to enable WebView2 remote debugging on port `9222`. The endpoint is intended for local access and has no login of its own. Other software running on your PC may be able to connect while Wuwa Tappo is open. Review `ui_sync.py` (or `source/ui_sync.py` in the nested source layout) before using this feature, and do not run untrusted software alongside it. The setting remains in your Windows user environment after the helper exits; remove only the added `--remote-debugging-port=9222` argument from that variable if you no longer want it enabled. Existing arguments may belong to other software.
+**WebView2 debugging notice:** To hide and restore the chest controls and refresh the in-app click display, the helper sets the per-user `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable to enable WebView2 remote debugging on port `9222`. If Tappo was already running, the helper asks before restarting it; the endpoint is intended for local access and has no login of its own. Other software running on your PC may be able to connect while Wuwa Tappo is open. Review `ui_sync.py` (or `source/ui_sync.py` in the nested source layout) before using this feature, and do not run untrusted software alongside it. The setting remains in your Windows user environment after the helper exits; remove only the added `--remote-debugging-port=9222` argument from that variable if you no longer want it enabled. Existing arguments may belong to other software.
 
 The prebuilt executable is not code-signed. Review the source and release checksum before running it. This project is independent and is not affiliated with, endorsed by, or sponsored by KURO GAMES or Irox Games. The service may change or restrict its undocumented interfaces, so the helper may stop working. Use it in accordance with the app's applicable rules.
 
