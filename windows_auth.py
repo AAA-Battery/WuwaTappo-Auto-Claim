@@ -158,6 +158,8 @@ def pair_existing_session():
     finally:
         if stopped and app_exe_path and app_exe_path.exists():
             try:
-                subprocess.Popen([str(app_exe_path)], cwd=str(app_exe_path.parent))
+                run_env = os.environ.copy()
+                run_env['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = '--remote-debugging-port=9222'
+                subprocess.Popen([str(app_exe_path)], cwd=str(app_exe_path.parent), env=run_env)
             except Exception:
                 record('restart-error', 'Pairing complete. Please reopen Wuwa Tappo.')

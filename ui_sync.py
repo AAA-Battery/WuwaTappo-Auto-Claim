@@ -209,6 +209,40 @@ def set_chests_hidden(hidden=True, timeout=5.0):
         time.sleep(0.35)
 
 
+def set_tappo_click_state(gross, consumed, timeout=5.0):
+    """Patch server-confirmed click totals into the live Vue/Pinia store."""
+    if type(gross) is not int or type(consumed) is not int or gross < 0 or consumed < 0:
+        return False
+
+    script = """
+    (() => {
+        const pinia = document.querySelector('#app')?.__vue_app__?.config?.globalProperties?.$pinia;
+        const store = pinia?._s?.get('GlobalState');
+        if (!store || !store.userInfo || typeof store.userInfo !== 'object') return false;
+        store.userInfo = {
+            ...store.userInfo,
+            total_click_count: __GROSS__,
+            total_click_consume: __CONSUMED__
+        };
+        return store.userInfo.total_click_count === __GROSS__
+            && store.userInfo.total_click_consume === __CONSUMED__;
+    })();
+    """.replace('__GROSS__', json.dumps(gross)).replace('__CONSUMED__', json.dumps(consumed))
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        targets = get_page_targets()
+        if targets:
+            try:
+                if asyncio.run(_apply_script(targets, script)):
+                    return True
+            except RuntimeError:
+                return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.35)
+
+
 async def _command(socket, method, params=None, pending_events=None, timeout=3.0):
     command_id = next(_COMMAND_IDS)
     await socket.send(json.dumps({
@@ -333,58 +367,69 @@ def reload_game_ui(timeout=12.0):
 
 
 def sync_after_claim(timeout=15.0, should_hide=lambda: True):
-    """Refresh server-owned cooldown/click UI, then apply the current visibility state."""
-    started = time.monotonic()
-    if not reload_game_ui(timeout=timeout):
-        return False
-    remaining = max(0.0, timeout - (time.monotonic() - started))
-    return set_chests_hidden(bool(should_hide()), timeout=remaining)
+    """Reapply chest visibility after claim without reloading the Tappo page."""
+    return set_chests_hidden(bool(should_hide()), timeout=timeout)
 
 
-def restart_tappo_for_ui_sync(timeout=30.0, hide_chests=True):
-    """Restart the installed Tappo with CDP enabled, without changing its session."""
+def restart_tappo_for_ui_sync(timeout=45.0, hide_chests=True):
+    """Ensure Tappo exposes CDP, restarting it only when the live endpoint is unavailable."""
     ensure_webview2_cdp_env()
+
+    # Do not restart an already synchronized app just because the user requested a re-sync.
+    if get_page_targets() and set_chests_hidden(hide_chests, timeout=2.0):
+        return True, 'Tappo interface is synchronized.'
+
     running = []
+    found_running_app = False
+    unresolved_process = False
     for process in psutil.process_iter(["name", "exe"]):
         try:
             if (process.info.get("name") or "").lower() != "wuwatappo.exe":
                 continue
+            found_running_app = True
             running_path = process.info.get("exe")
             if running_path and Path(running_path).is_file():
                 running.append((process, Path(running_path)))
+            else:
+                unresolved_process = True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
+    if unresolved_process:
+        return False, 'Windows found Wuwa Tappo but would not reveal its executable path. Close Tappo manually, then retry.'
+
     app_exe = running[0][1] if running else find_app_exe()
-    if app_exe is None:
-        return False
+    if app_exe is None or not app_exe.is_file():
+        return False, 'Could not find the installed Wuwa Tappo executable. Open Tappo and retry UI sync.'
+
     roots = [
         process for process, running_path in running
         if running_path.resolve() == app_exe.resolve()
     ]
-
-    if app_exe is None or not app_exe.is_file():
-        return False
+    if found_running_app and not roots:
+        return False, 'Wuwa Tappo is running but could not be safely restarted. Close it manually, then retry UI sync.'
 
     if roots:
         # Tappo persists pending clicks every five seconds; allow that write to finish.
         time.sleep(5.5)
         children_by_pid = {}
-        for process in roots:
-            try:
+        try:
+            for process in roots:
                 for child in process.children(recursive=True):
                     children_by_pid[child.pid] = child
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return False, 'Windows denied access to Tappo processes. Close Tappo manually, then retry UI sync.'
         children = list(children_by_pid.values())
 
         try:
             for process in roots:
                 if process.is_running():
                     process.terminate()
-            _, alive_roots = psutil.wait_procs(roots, timeout=6)
+            _, alive_roots = psutil.wait_procs(roots, timeout=8)
             if alive_roots:
-                return False
+                if get_page_targets() and set_chests_hidden(hide_chests, timeout=2.0):
+                    return True, 'Tappo was already synchronized; leaving it open.'
+                return False, 'Windows could not close Wuwa Tappo. Close it manually, then retry UI sync.'
 
             for child in children:
                 try:
@@ -394,18 +439,24 @@ def restart_tappo_for_ui_sync(timeout=30.0, hide_chests=True):
                     continue
             psutil.wait_procs(children, timeout=4)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            return False
+            return False, 'Windows denied permission to restart Wuwa Tappo. Close it manually, then retry UI sync.'
 
     run_env = os.environ.copy()
     run_env[CDP_ENV] = _with_cdp_argument(run_env.get(CDP_ENV, ""))
     try:
         subprocess.Popen([str(app_exe)], cwd=str(app_exe.parent), env=run_env)
-    except OSError:
-        return False
+    except OSError as exc:
+        return False, f'Could not relaunch Wuwa Tappo ({type(exc).__name__}). Open it manually, then retry UI sync.'
 
     deadline = time.monotonic() + max(0.0, timeout)
+    last_target_count = 0
     while time.monotonic() < deadline:
-        if get_page_targets() and set_chests_hidden(hide_chests, timeout=1.0):
-            return True
+        targets = get_page_targets()
+        last_target_count = max(last_target_count, len(targets))
+        if targets and set_chests_hidden(hide_chests, timeout=1.0):
+            return True, 'Tappo restarted and interface synchronized.'
         time.sleep(0.5)
-    return False
+
+    if last_target_count:
+        return False, 'Tappo reopened, but its page did not accept the UI sync command. Close it and retry.'
+    return False, 'Tappo reopened without exposing CDP on port 9222. Check the WebView2 connection setting, then retry.'

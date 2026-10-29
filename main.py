@@ -19,9 +19,9 @@ from PIL import Image
 
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
-from ui_sync import set_chests_hidden, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
+from ui_sync import set_chests_hidden, set_tappo_click_state, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
 
-VERSION = '1.0.3'
+VERSION = '1.0.5'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -84,9 +84,14 @@ class TrayApp:
         self.server_balance = None
         self.status_data = {}
         self.ui_sync_warned = False
-        self.ui_restart_prompted = False
+        self.ui_restart_attempted = False
         self.ui_restart_running = False
         self.ui_sync_failure = threading.Event()
+        self.tappo_click_sync_pending = False
+        self.tappo_click_sync_inflight = False
+        self.tappo_click_sync_generation = 0
+        self.tappo_claim_generation = 0
+        self.tappo_click_sync_lock = threading.Lock()
         self.ui_exit_sync_done = threading.Event()
         self.stopping = False
         self.root = tk.Tk()
@@ -139,7 +144,7 @@ class TrayApp:
         footer = ttk.Frame(frame)
         footer.pack(fill='x', pady=(18, 0))
         ttk.Button(footer, text='Open Activity Log', command=self.open_log_file).pack(side='left')
-        self.restart_button = ttk.Button(footer, text='Restart Tappo for UI sync', command=self.prompt_tappo_restart)
+        self.restart_button = ttk.Button(footer, text='Re-sync Tappo UI', command=self.prompt_tappo_restart)
         self.restart_button.pack(side='left', padx=8)
         ttk.Button(footer, text='Exit', command=self.quit).pack(side='right')
         
@@ -220,23 +225,48 @@ class TrayApp:
                 self.messages.put(('ui_sync_unavailable', {}))
         threading.Thread(target=run, name='tappo-ui-sync', daemon=True).start()
 
+    def sync_tappo_click_state(self, gross, consumed):
+        self.tappo_click_sync_generation += 1
+        generation = self.tappo_click_sync_generation
+        claim_generation = self.tappo_claim_generation
+        self.tappo_click_sync_inflight = True
+
+        def run():
+            with self.tappo_click_sync_lock:
+                if generation != self.tappo_click_sync_generation:
+                    return
+                success = set_tappo_click_state(gross, consumed, timeout=5.0)
+            self.messages.put(('tappo_click_sync_result', {
+                'generation': generation,
+                'claim_generation': claim_generation,
+                'success': success,
+            }))
+
+        threading.Thread(target=run, name='tappo-click-sync', daemon=True).start()
+
     def prompt_tappo_restart(self):
+        """Re-sync now; restart Tappo only if its live CDP endpoint is unavailable."""
+        self.start_tappo_restart(automatic=False)
+
+    def start_tappo_restart(self, automatic=False):
         if self.ui_restart_running or self.stopping:
             return
-        if not messagebox.askyesno(
-            'Restart Wuwa Tappo for UI sync',
-            'Tappo must restart once to enable the local WebView connection used to hide chest controls and refresh the click display. The helper waits 5.5 seconds for pending clicks to save before closing it. Continue?',
-            parent=self.root
-        ):
-            return
         self.ui_restart_running = True
+        self.ui_restart_attempted = True
         self.restart_button.configure(state='disabled')
-        self.status.set('Waiting for Tappo to restart and sync its interface...')
+        if automatic:
+            self.status.set('Tappo UI sync is unavailable; restarting Tappo after its save interval...')
+        else:
+            self.status.set('Re-syncing Tappo; it will restart only if needed...')
         threading.Thread(target=self.restart_app_for_ui_sync, name='tappo-ui-restart', daemon=True).start()
 
     def restart_app_for_ui_sync(self):
-        success = restart_tappo_for_ui_sync(hide_chests=self.active.is_set())
-        self.messages.put(('ui_sync_restart_succeeded' if success else 'ui_sync_restart_failed', {}))
+        success, detail = restart_tappo_for_ui_sync(hide_chests=self.active.is_set())
+        self.log.info('UI sync restart %s: %s', 'succeeded' if success else 'failed', detail)
+        self.messages.put((
+            'ui_sync_restart_succeeded' if success else 'ui_sync_restart_failed',
+            {'detail': detail},
+        ))
 
     def toggle(self):
         if not self.pairing:
@@ -377,40 +407,54 @@ class TrayApp:
                 self.countdowns = (time.monotonic(), data['left'], data['right'])
                 self.server_balance = data['balance']
                 self.balance.set(f"Available server clicks: {self.server_balance:,}")
+                if self.tappo_click_sync_pending and not self.tappo_click_sync_inflight:
+                    self.sync_tappo_click_state(data['gross'], data['consumed'])
                 if self.active.is_set() and not self.ui_sync_warned:
                     self.status.set('Waiting for server cooldown...')
+            elif event == 'tappo_click_sync_result':
+                if data['generation'] == self.tappo_click_sync_generation:
+                    self.tappo_click_sync_inflight = False
+                    if data['success'] and data['claim_generation'] == self.tappo_claim_generation:
+                        self.tappo_click_sync_pending = False
+                    elif not data['success']:
+                        self.log.warning('Could not update Tappo click display without reloading.')
             elif event == 'need_clicks' and self.active.is_set():
                 self.status.set('Not enough clicks (need >= 1,000). Keep clicking in the app.')
             elif event == 'ui_sync_unavailable':
                 self.ui_sync_warned = True
-                self.status.set('Tappo interface sync is unavailable. Restart Tappo to hide chest controls and refresh its click display.')
-                if not self.ui_restart_prompted:
-                    self.ui_restart_prompted = True
-                    self.root.after(100, self.prompt_tappo_restart)
+                if not self.ui_restart_attempted and not self.ui_restart_running:
+                    self.status.set('Tappo UI sync is unavailable; restarting Tappo automatically...')
+                    self.root.after(100, lambda: self.start_tappo_restart(automatic=True))
+                else:
+                    self.status.set('Tappo UI sync is unavailable. Click Re-sync Tappo UI to try again.')
             elif event == 'ui_sync_available':
                 self.ui_sync_warned = False
+                self.ui_restart_attempted = False
                 if self.active.is_set():
                     self.status.set('Tappo interface synchronized; waiting for server cooldown...')
             elif event == 'ui_sync_restart_succeeded':
                 self.ui_sync_failure.clear()
                 self.ui_restart_running = False
+                self.ui_restart_attempted = False
                 self.restart_button.configure(state='normal')
                 self.ui_sync_warned = False
-                self.status.set('Tappo restarted and interface synchronized.')
+                self.status.set(data.get('detail', 'Tappo interface synchronized.'))
             elif event == 'ui_sync_restart_failed':
                 self.ui_restart_running = False
                 self.restart_button.configure(state='normal')
                 self.ui_sync_warned = True
-                self.status.set('Could not synchronize Tappo. Close it manually, then try Restart Tappo for UI sync again.')
+                self.status.set(data.get('detail', 'Could not synchronize Tappo. Click Re-sync Tappo UI to try again.'))
             elif event == 'claimed':
                 self.claim_count += 1
+                self.tappo_claim_generation += 1
+                self.tappo_click_sync_pending = True
                 if self.server_balance is not None:
                     self.server_balance = max(0, self.server_balance - 1000)
                     self.balance.set(f"Available server clicks: {self.server_balance:,} (refreshing from server...)")
                 self.wake.set()
                 kind = {'character_skin': 'Character', 'accessory': 'Accessory', 'emote': 'Emote'}.get(data.get('asset_type'), 'New Item')
                 self.latest.set(f'Claimed {self.claim_count} chest(s) in this session • {kind}')
-                self.status.set('Chest claimed; updating the click balance and chest display...')
+                self.status.set('Chest claimed; syncing clicks and chest display without reloading...')
                 self.sync_chests(after_claim=True)
             elif event == 'app_closed':
                 self.status.set('Waiting for Wuwa Tappo to open...')
@@ -541,4 +585,3 @@ if __name__ == '__main__':
         import traceback
         (DATA_DIR / 'startup-error.txt').write_text(traceback.format_exc(), encoding='utf8')
         sys.exit(1)
-

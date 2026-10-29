@@ -176,7 +176,8 @@ class Engine:
     def step(self, allow_claim=True):
         state = self.inspect()
         now = self.api.clock.now()
-        self.emit('status', balance=state.balance, left=max(0, state.deadlines['left'] - now),
+        self.emit('status', balance=state.balance, gross=state.gross, consumed=state.consumed,
+                  left=max(0, state.deadlines['left'] - now),
                   right=max(0, state.deadlines['right'] - now))
         if state.balance < 1000:
             self.emit('need_clicks', balance=state.balance)
