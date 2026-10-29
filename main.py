@@ -87,6 +87,7 @@ class TrayApp:
         self.ui_restart_prompted = False
         self.ui_restart_running = False
         self.ui_sync_failure = threading.Event()
+        self.ui_exit_sync_done = threading.Event()
         self.stopping = False
         self.root = tk.Tk()
         self.root.title('Wuwa Tappo • Chest Auto-Claim')
@@ -452,10 +453,15 @@ class TrayApp:
         self.active.clear()
         self.exit_event.set()
         self.wake.set()
-        self.sync_chests(False)
+        def restore_chests_before_exit():
+            try:
+                set_chests_hidden(False, timeout=3.0)
+            finally:
+                self.ui_exit_sync_done.set()
+        threading.Thread(target=restore_chests_before_exit, name='tappo-ui-restore', daemon=True).start()
         self.status.set('Finishing current request before exit...')
         def finish():
-            if self.thread.is_alive():
+            if self.thread.is_alive() or not self.ui_exit_sync_done.is_set():
                 self.root.after(200, finish)
                 return
             self.log.info('Tool stopped')
