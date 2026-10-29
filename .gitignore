@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging & PyInstaller
+build/
+dist/
+*.spec
+_internal/
+*.exe
+*.zip
+
+# User session, journal, and runtime logs
+*.log
+*.flag
+*.tmp
+session.dpapi
+pair-status.json
+status.json
+diagnostics.json
+claim-journal.json
+startup-error.txt
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# IDE configurations
+.vscode/
+.idea/
