@@ -19,9 +19,9 @@ from PIL import Image
 
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
-from ui_sync import set_chests_hidden, reload_game_ui, ensure_webview2_cdp_env
+from ui_sync import set_chests_hidden, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -68,6 +68,7 @@ def configure_log():
 
 class TrayApp:
     def __init__(self, enabled=False, minimized=False):
+        ensure_webview2_cdp_env()
         self.log = configure_log()
         self.messages = queue.Queue()
         self.exit_event, self.wake = threading.Event(), threading.Event()
@@ -80,7 +81,12 @@ class TrayApp:
         self.pair_started = 0
         self.claim_count = 0
         self.countdowns = None
+        self.server_balance = None
         self.status_data = {}
+        self.ui_sync_warned = False
+        self.ui_restart_prompted = False
+        self.ui_restart_running = False
+        self.ui_sync_failure = threading.Event()
         self.stopping = False
         self.root = tk.Tk()
         self.root.title('Wuwa Tappo • Chest Auto-Claim')
@@ -132,6 +138,8 @@ class TrayApp:
         footer = ttk.Frame(frame)
         footer.pack(fill='x', pady=(18, 0))
         ttk.Button(footer, text='Open Activity Log', command=self.open_log_file).pack(side='left')
+        self.restart_button = ttk.Button(footer, text='Restart Tappo for UI sync', command=self.prompt_tappo_restart)
+        self.restart_button.pack(side='left', padx=8)
         ttk.Button(footer, text='Exit', command=self.quit).pack(side='right')
         
         ttk.Label(frame, text='Keep Wuwa Tappo running. Never changes system time or fabricates clicks.\nClosing this window minimizes to the system tray.', style='Muted.TLabel').pack(anchor='w', pady=(12, 0))
@@ -160,7 +168,6 @@ class TrayApp:
             self.root.withdraw()
         self.root.after(300, self.tick)
         (DATA_DIR / 'startup-error.txt').unlink(missing_ok=True)
-        ensure_webview2_cdp_env()
         self.log.info('Tool started v%s', VERSION)
 
     def open_log_file(self):
@@ -185,15 +192,50 @@ class TrayApp:
         if enabled:
             self.active.set()
             self.status.set('Checking server time...')
-            threading.Thread(target=set_chests_hidden, args=(True,), daemon=True).start()
+            self.sync_chests(True)
         else:
             self.active.clear()
             self.status.set('Paused. No new claim requests will be sent.')
-            threading.Thread(target=set_chests_hidden, args=(False,), daemon=True).start()
+            self.sync_chests(False)
         write_config(enabled)
         self.toggle_button.configure(text='Pause Auto-Claim' if enabled else 'Enable Auto-Claim')
         self.tray.title = 'Wuwa Tappo • ' + ('Auto-Claim Active' if enabled else 'Paused')
         self.wake.set()
+
+    def sync_chests(self, hidden=True, after_claim=False):
+        def run():
+            if after_claim:
+                success = sync_after_claim(should_hide=lambda: self.active.is_set())
+                should_hide = self.active.is_set()
+            else:
+                success = set_chests_hidden(hidden)
+                should_hide = hidden
+            if success:
+                if self.ui_sync_failure.is_set():
+                    self.ui_sync_failure.clear()
+                    self.messages.put(('ui_sync_available', {}))
+            elif should_hide and not self.ui_sync_failure.is_set():
+                self.ui_sync_failure.set()
+                self.messages.put(('ui_sync_unavailable', {}))
+        threading.Thread(target=run, name='tappo-ui-sync', daemon=True).start()
+
+    def prompt_tappo_restart(self):
+        if self.ui_restart_running or self.stopping:
+            return
+        if not messagebox.askyesno(
+            'Restart Wuwa Tappo for UI sync',
+            'Tappo must restart once to enable the local WebView connection used to hide chest controls and refresh the click display. The helper waits 5.5 seconds for pending clicks to save before closing it. Continue?',
+            parent=self.root
+        ):
+            return
+        self.ui_restart_running = True
+        self.restart_button.configure(state='disabled')
+        self.status.set('Waiting for Tappo to restart and sync its interface...')
+        threading.Thread(target=self.restart_app_for_ui_sync, name='tappo-ui-restart', daemon=True).start()
+
+    def restart_app_for_ui_sync(self):
+        success = restart_tappo_for_ui_sync(hide_chests=self.active.is_set())
+        self.messages.put(('ui_sync_restart_succeeded' if success else 'ui_sync_restart_failed', {}))
 
     def toggle(self):
         if not self.pairing:
@@ -267,7 +309,7 @@ class TrayApp:
                     delay = self.engine.step()
                     backoff = 30
                     if self.active.is_set():
-                        threading.Thread(target=set_chests_hidden, args=(True,), daemon=True).start()
+                        self.sync_chests(True)
             except AuthError:
                 self.active.clear()
                 self.reset_client()
@@ -332,21 +374,43 @@ class TrayApp:
                 self.status.set(data.get('detail', 'Pairing failed.'))
             elif event == 'status':
                 self.countdowns = (time.monotonic(), data['left'], data['right'])
-                self.balance.set(f"Available server clicks: {data['balance']:,}")
-                if self.active.is_set():
+                self.server_balance = data['balance']
+                self.balance.set(f"Available server clicks: {self.server_balance:,}")
+                if self.active.is_set() and not self.ui_sync_warned:
                     self.status.set('Waiting for server cooldown...')
             elif event == 'need_clicks' and self.active.is_set():
                 self.status.set('Not enough clicks (need >= 1,000). Keep clicking in the app.')
+            elif event == 'ui_sync_unavailable':
+                self.ui_sync_warned = True
+                self.status.set('Tappo interface sync is unavailable. Restart Tappo to hide chest controls and refresh its click display.')
+                if not self.ui_restart_prompted:
+                    self.ui_restart_prompted = True
+                    self.root.after(100, self.prompt_tappo_restart)
+            elif event == 'ui_sync_available':
+                self.ui_sync_warned = False
+                if self.active.is_set():
+                    self.status.set('Tappo interface synchronized; waiting for server cooldown...')
+            elif event == 'ui_sync_restart_succeeded':
+                self.ui_sync_failure.clear()
+                self.ui_restart_running = False
+                self.restart_button.configure(state='normal')
+                self.ui_sync_warned = False
+                self.status.set('Tappo restarted and interface synchronized.')
+            elif event == 'ui_sync_restart_failed':
+                self.ui_restart_running = False
+                self.restart_button.configure(state='normal')
+                self.ui_sync_warned = True
+                self.status.set('Could not synchronize Tappo. Close it manually, then try Restart Tappo for UI sync again.')
             elif event == 'claimed':
                 self.claim_count += 1
+                if self.server_balance is not None:
+                    self.server_balance = max(0, self.server_balance - 1000)
+                    self.balance.set(f"Available server clicks: {self.server_balance:,} (refreshing from server...)")
+                self.wake.set()
                 kind = {'character_skin': 'Character', 'accessory': 'Accessory', 'emote': 'Emote'}.get(data.get('asset_type'), 'New Item')
                 self.latest.set(f'Claimed {self.claim_count} chest(s) in this session • {kind}')
-                self.status.set('Chest claimed; updating next cooldown...')
-                def _sync_claimed():
-                    reload_game_ui()
-                    time.sleep(1.0)
-                    set_chests_hidden(True)
-                threading.Thread(target=_sync_claimed, daemon=True).start()
+                self.status.set('Chest claimed; updating the click balance and chest display...')
+                self.sync_chests(after_claim=True)
             elif event == 'app_closed':
                 self.status.set('Waiting for Wuwa Tappo to open...')
             elif event == 'auth_needed':
@@ -388,7 +452,7 @@ class TrayApp:
         self.active.clear()
         self.exit_event.set()
         self.wake.set()
-        threading.Thread(target=set_chests_hidden, args=(False,), daemon=True).start()
+        self.sync_chests(False)
         self.status.set('Finishing current request before exit...')
         def finish():
             if self.thread.is_alive():
