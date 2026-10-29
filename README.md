@@ -24,7 +24,7 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.1.zip`.
+1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.2.zip`.
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
@@ -40,7 +40,7 @@ Wuwa Tappo's service creates a chest after its 30-minute active-time cycle. Clai
 
 The helper reads only the `kuro_infoToken` session cookie in Wuwa Tappo's own WebView2 profile when you choose to pair. It does not read Chrome, Edge, or Firefox profiles and does not store your password. The saved session is protected with Windows DPAPI for the current Windows account. API requests go to the Wuwa Tappo service configured in the source; logs omit session tokens and authorization headers. Tool data is stored under `%LOCALAPPDATA%\WuwaTappoAutoClaim`.
 
-**WebView2 debugging notice:** To hide and restore the chest controls in the Wuwa Tappo window, the helper sets the per-user `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable to enable WebView2 remote debugging on port `9222`. The endpoint is intended for local access and has no login of its own. Other software running on your PC may be able to connect while Wuwa Tappo is open. Review `source/ui_sync.py` before using this feature, and do not run untrusted software alongside it. The setting remains in your Windows user environment after the helper exits; remove only the added `--remote-debugging-port=9222` argument from that variable if you no longer want it enabled. Existing arguments may belong to other software.
+**WebView2 debugging notice:** To hide and restore the chest controls in the Wuwa Tappo window, the helper sets the per-user `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable to enable WebView2 remote debugging on port `9222`. The endpoint is intended for local access and has no login of its own. Other software running on your PC may be able to connect while Wuwa Tappo is open. Review `ui_sync.py` (or `source/ui_sync.py` in the nested source layout) before using this feature, and do not run untrusted software alongside it. The setting remains in your Windows user environment after the helper exits; remove only the added `--remote-debugging-port=9222` argument from that variable if you no longer want it enabled. Existing arguments may belong to other software.
 
 The prebuilt executable is not code-signed. Review the source and release checksum before running it. This project is independent and is not affiliated with, endorsed by, or sponsored by KURO GAMES or Irox Games. The service may change or restrict its undocumented interfaces, so the helper may stop working. Use it in accordance with the app's applicable rules.
 
@@ -51,18 +51,20 @@ The prebuilt executable is not code-signed. Review the source and release checks
 3. Install dependencies:
 
    ```powershell
-   python -m pip install -r source/requirements.txt
+   python -m pip install -r requirements.txt  # GitHub source ZIP
+   # For the nested source layout instead: python -m pip install -r source/requirements.txt
    ```
 
 4. Run the UI:
 
    ```powershell
-   python source/main.py
+   python main.py  # GitHub source ZIP
+   # For the nested source layout instead: python source/main.py
    ```
 
-5. To build the portable folder, run `build.bat`. The output is placed in `dist/WuwaTappoAutoClaim/`. Copy `README.md`, `LICENSE`, `Run-Background.vbs`, and `Stop-Tool.vbs` beside the executable before making a ZIP for distribution.
+5. To build the portable folder, run `build.bat`. The script accepts both the GitHub source archive layout (Python files at the root) and the nested `source/` layout. It installs dependencies into the same Python environment used by PyInstaller, verifies the tray dependencies, and embeds `Zani.ico` plus `Zani.png`. The output is placed in `dist/WuwaTappoAutoClaim/`. Copy `README.md`, `LICENSE`, `Run-Background.vbs`, and `Stop-Tool.vbs` beside the executable before making a ZIP for distribution.
 
-The source includes a unit test module at `source/test_core.py`; dependencies are listed in `source/requirements.txt`.
+The included character artwork is supplied as the app icon and is separate from the MIT-licensed project code; image rights remain with its respective owner. The source includes a unit test module at `source/test_core.py` (or `test_core.py` in the root layout); dependencies are listed in `source/requirements.txt` (or `requirements.txt` in the root layout).
 
 ## Command-line options
 
@@ -77,3 +79,4 @@ The source includes a unit test module at `source/test_core.py`; dependencies ar
 ## License
 
 The project's original code and documentation are provided under the [MIT License](LICENSE). Third-party dependencies and their bundled components remain under their respective licenses.
+
