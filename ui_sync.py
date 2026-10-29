@@ -58,7 +58,7 @@ SHOW_SCRIPT = """
     document.querySelectorAll(
         '.reward-anchor, .reward-anchor--left, .reward-anchor--right, .reward-btn, .chest-reward-popup-layer, [class*="chest-reward-popup"], [class*="reward-anchor"], [class*="reward-btn"]'
     ).forEach(el => {
-        for (const property of ['display', 'visibility', 'pointer-events', 'opacity', 'width', 'height']) {
+        for (const property of ['display', 'visibility', 'pointer-events', 'opacity']) {
             el.style.removeProperty(property);
         }
     });
