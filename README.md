@@ -2,7 +2,10 @@
 
 An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after the server says its cooldown has ended. It does not shorten or bypass the server cooldown.
 
-**Download the latest Windows build:** [GitHub Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest)  
+**Latest release:** [WuwaTappoAutoClaim-v1.1.0.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.0/WuwaTappoAutoClaim-v1.1.0.zip)
+
+**Current public release:** [GitHub Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest)
+
 **License:** [MIT](LICENSE)
 
 ## What it does
@@ -10,7 +13,7 @@ An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after th
 - Reads the two chest deadlines and eligible click balance from the Wuwa Tappo service.
 - Waits for the server deadline, then sends one claim request for a ready chest when at least 1,000 server-recorded clicks are available.
 - Processes the two chest slots one at a time and records outcomes locally to avoid repeating a successful claim.
-- Shows countdowns and status in a small Windows tray app. You can pause, resume, inspect the activity log, or exit.
+- Shows chest timers, server clicks, session claim totals, rarity counts, and the latest reward in a refreshed Windows dashboard. You can pause or resume, re-pair, open the activity log, re-sync Tappo, minimize to the tray, or exit.
 - Hides chest controls while auto-claim is active and updates Tappo's displayed click balance from the server after a claim, without reloading the page.
 - Uses the server's response time and a monotonic timer, so changing the Windows clock does not make a chest ready sooner.
 
@@ -25,13 +28,19 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Open [Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest) and download `WuwaTappoAutoClaim-v1.0.5.zip`.
+1. Download `WuwaTappoAutoClaim-v1.1.0.zip` from the [v1.1.0 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.0).
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
 5. Choose **Enable Auto-Claim**. If UI sync is unavailable, the helper automatically waits for Tappo to save pending clicks, then restarts it once with the WebView2 setting needed for UI synchronization. Use **Re-sync Tappo UI** to try again; it first checks the live connection and only restarts Tappo if needed. Close or minimize the dashboard to keep the helper in the notification area.
 
 You can instead run `Run-Background.vbs` to start minimized with auto-claim enabled. Use **Exit** in the tray menu or `Stop-Tool.vbs` to stop it. It is not added to Windows Startup or Task Scheduler; launch it again after a Windows restart.
+
+## Version 1.1.0
+
+- Replace the older compact window with the new dashboard layout, including timer cards, server-click balance, session claim and rarity totals, last-claim details, action buttons, and a settings dialog.
+- Keep the existing tray controls, session pairing, cooldown handling, chest visibility sync, and live click-count refresh connected to the new UI.
+- Improve the window title bar appearance and adjust the footer layout while keeping the main action buttons and Settings/Exit button sizes unchanged.
 
 ## Version 1.0.5
 

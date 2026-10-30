@@ -13,15 +13,17 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 import pystray
 from PIL import Image
+
+from chest_autoclaim_ui import ChestAutoClaimUI
 
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
 from ui_sync import set_chests_hidden, set_tappo_click_state, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
 
-VERSION = '1.0.5'
+VERSION = '1.1.0'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -95,60 +97,25 @@ class TrayApp:
         self.ui_exit_sync_done = threading.Event()
         self.stopping = False
         self.root = tk.Tk()
-        self.root.title('Wuwa Tappo • Chest Auto-Claim')
         self.window_icon = tk.PhotoImage(file=str(resource_path('Zani.png')))
         self.root.iconphoto(True, self.window_icon)
-        self.root.geometry('600x540')
-        self.root.minsize(560, 540)
-        self.root.configure(bg='#121b2a')
-        style = ttk.Style(self.root)
-        style.theme_use('clam')
-        style.configure('TFrame', background='#121b2a')
-        style.configure('TLabel', background='#121b2a', foreground='#e4edf6', font=('Segoe UI', 10))
-        style.configure('Title.TLabel', font=('Segoe UI', 18, 'bold'))
-        style.configure('Muted.TLabel', foreground='#a7bacd')
-        style.configure('Count.TLabel', font=('Segoe UI', 17, 'bold'), foreground='#63d6b2')
-        style.configure('TButton', font=('Segoe UI', 10), padding=(12, 8))
-        
-        frame = ttk.Frame(self.root, padding=24)
-        frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Chest Auto-Claim', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(frame, text='Wuwa Tappo  ·  Synchronized with official server cooldown', style='Muted.TLabel').pack(anchor='w', pady=(4, 18))
-        
-        self.status = tk.StringVar(value='Ready' if AUTH_FILE.exists() else 'Please pair with a logged-in Wuwa Tappo session to start.')
-        ttk.Label(frame, textvariable=self.status, wraplength=510).pack(anchor='w', pady=(0, 14))
-        
-        row = ttk.Frame(frame)
-        row.pack(fill='x')
-        self.left = tk.StringVar(value='—')
-        self.right = tk.StringVar(value='—')
-        for title, var in [('LEFT CHEST', self.left), ('RIGHT CHEST', self.right)]:
-            box = ttk.Frame(row)
-            box.pack(side='left', expand=True, fill='x')
-            ttk.Label(box, text=title, style='Muted.TLabel').pack(anchor='w')
-            ttk.Label(box, textvariable=var, style='Count.TLabel').pack(anchor='w', pady=(6, 12))
-            
-        self.balance = tk.StringVar(value='Available server clicks: —')
-        self.latest = tk.StringVar(value='No chests claimed in this session yet.')
-        ttk.Label(frame, textvariable=self.balance).pack(anchor='w')
-        ttk.Label(frame, textvariable=self.latest, wraplength=510, style='Muted.TLabel').pack(anchor='w', pady=(8, 16))
-        
-        controls = ttk.Frame(frame)
-        controls.pack(fill='x')
-        self.toggle_button = ttk.Button(controls, text='Enable Auto-Claim', command=self.toggle)
-        self.toggle_button.pack(side='left')
-        self.pair_button = ttk.Button(controls, text='Re-pair Session', command=self.pair)
-        self.pair_button.pack(side='left', padx=8)
-        ttk.Button(controls, text='Minimize to Tray', command=self.hide).pack(side='left')
-        
-        footer = ttk.Frame(frame)
-        footer.pack(fill='x', pady=(18, 0))
-        ttk.Button(footer, text='Open Activity Log', command=self.open_log_file).pack(side='left')
-        self.restart_button = ttk.Button(footer, text='Re-sync Tappo UI', command=self.prompt_tappo_restart)
-        self.restart_button.pack(side='left', padx=8)
-        ttk.Button(footer, text='Exit', command=self.quit).pack(side='right')
-        
-        ttk.Label(frame, text='Keep Wuwa Tappo running. Never changes system time or fabricates clicks.\nClosing this window minimizes to the system tray.', style='Muted.TLabel').pack(anchor='w', pady=(12, 0))
+        self.status_text = 'Ready' if AUTH_FILE.exists() else 'Please pair with a logged-in Wuwa Tappo session to start.'
+        self.rarity_counts = {'epic': 0, 'rare': 0, 'uncommon': 0, 'common': 0}
+        self.ui = ChestAutoClaimUI(
+            self.root,
+            on_toggle_pause=self.toggle,
+            on_repair=self.pair,
+            on_minimize=self.hide,
+            on_open_log=self.open_log_file,
+            on_resync=self.prompt_tappo_restart,
+            on_exit=self.quit,
+        )
+        self.ui.set_auto_claim_state(False)
+        self.ui.set_status(self.status_text, 'paused' if AUTH_FILE.exists() else 'error')
+        self.ui.set_available_clicks(None)
+        self.ui.set_claimed(0)
+        self.ui.set_last_claim(None)
+        self.ui.set_timers('—:—', '—:—')
         
         self.tray_icon_image = Image.open(resource_path('Zani.png')).convert('RGBA')
         self.tray_icon_image.thumbnail((64, 64), Image.Resampling.LANCZOS)
@@ -162,9 +129,7 @@ class TrayApp:
             )
         )
         self.tray.run_detached()
-        self.root.protocol('WM_DELETE_WINDOW', self.hide)
         self.root.update_idletasks()
-        self.root.geometry(f'600x{max(540, self.root.winfo_reqheight() + 20)}')
         
         self.thread = threading.Thread(target=self.worker, name='chest-worker', daemon=True)
         self.thread.start()
@@ -175,6 +140,24 @@ class TrayApp:
         self.root.after(300, self.tick)
         (DATA_DIR / 'startup-error.txt').unlink(missing_ok=True)
         self.log.info('Tool started v%s', VERSION)
+
+    def set_status(self, text, state=None):
+        self.status_text = str(text)
+        if state is None:
+            lower = self.status_text.lower()
+            if any(term in lower for term in (
+                'error', 'failed', 'could not', 'unavailable', 'not enough',
+                'expired', 'rejected', 'uncertain', 'temporarily', 'need to pair',
+                'please pair', 'timed out'
+            )):
+                state = 'error'
+            elif any(term in lower for term in ('waiting', 'checking', 'syncing', 'pairing', 'finishing')):
+                state = 'waiting'
+            elif self.active.is_set():
+                state = 'active'
+            else:
+                state = 'paused'
+        self.ui.set_status(self.status_text, state)
 
     def open_log_file(self):
         log_file = DATA_DIR / 'activity.log'
@@ -191,20 +174,21 @@ class TrayApp:
         if event not in ('status', 'need_clicks'):
             self.log.info('%s %s', event, json.dumps(data, ensure_ascii=False))
 
-    def set_enabled(self, enabled):
+    def set_enabled(self, enabled, paused=False):
         if enabled and not AUTH_FILE.exists():
-            self.status.set('Need to pair with Wuwa Tappo first.')
+            self.set_status('Need to pair with Wuwa Tappo first.', 'error')
+            self.ui.set_auto_claim_state(False)
             return
         if enabled:
             self.active.set()
-            self.status.set('Checking server time...')
+            self.set_status('Checking server time...', 'waiting')
             self.sync_chests(True)
         else:
             self.active.clear()
-            self.status.set('Paused. No new claim requests will be sent.')
+            self.set_status('Paused. No new claim requests will be sent.', 'paused')
             self.sync_chests(False)
         write_config(enabled)
-        self.toggle_button.configure(text='Pause Auto-Claim' if enabled else 'Enable Auto-Claim')
+        self.ui.set_auto_claim_state(enabled, paused=paused)
         self.tray.title = 'Wuwa Tappo • ' + ('Auto-Claim Active' if enabled else 'Paused')
         self.wake.set()
 
@@ -253,11 +237,11 @@ class TrayApp:
             return
         self.ui_restart_running = True
         self.ui_restart_attempted = True
-        self.restart_button.configure(state='disabled')
+        self.ui.set_resyncing(True)
         if automatic:
-            self.status.set('Tappo UI sync is unavailable; restarting Tappo after its save interval...')
+            self.set_status('Tappo UI sync is unavailable; restarting Tappo after its save interval...')
         else:
-            self.status.set('Re-syncing Tappo; it will restart only if needed...')
+            self.set_status('Re-syncing Tappo; it will restart only if needed...')
         threading.Thread(target=self.restart_app_for_ui_sync, name='tappo-ui-restart', daemon=True).start()
 
     def restart_app_for_ui_sync(self):
@@ -270,7 +254,8 @@ class TrayApp:
 
     def toggle(self):
         if not self.pairing:
-            self.set_enabled(not self.active.is_set())
+            enabled = not self.active.is_set()
+            self.set_enabled(enabled, paused=not enabled)
 
     def hide(self):
         self.root.withdraw()
@@ -296,8 +281,8 @@ class TrayApp:
         self.set_enabled(False)
         self.pairing = True
         self.pair_started = time.time()
-        self.pair_button.configure(state='disabled')
-        self.status.set('Pairing in progress; Wuwa Tappo will restart...')
+        self.ui.set_pairing(True)
+        self.set_status('Pairing in progress; Wuwa Tappo will restart...', 'waiting')
         executable = sys.executable
         args = ['--pair'] if getattr(sys, 'frozen', False) else [str(Path(__file__).resolve()), '--pair']
         shell = ctypes.WinDLL('shell32', use_last_error=True)
@@ -306,8 +291,8 @@ class TrayApp:
         result = shell.ShellExecuteW(None, 'runas', executable, subprocess.list2cmdline(args), None, 0)
         if not result or result <= 32:
             self.pairing = False
-            self.pair_button.configure(state='normal')
-            self.status.set('Could not launch elevated pairing process.')
+            self.ui.set_pairing(False)
+            self.set_status('Could not launch elevated pairing process.', 'error')
 
     def reset_client(self):
         if self.client:
@@ -381,14 +366,14 @@ class TrayApp:
                 data = json.loads((DATA_DIR / 'pair-status.json').read_text('utf8'))
                 if data.get('at', 0) >= self.pair_started and data['state'] != 'pairing':
                     self.pairing = False
-                    self.pair_button.configure(state='normal')
+                    self.ui.set_pairing(False)
                     self.messages.put(('paired' if data['state'] == 'paired' else 'pair_error', data))
             except (OSError, ValueError, KeyError):
                 pass
             if time.time() - self.pair_started > 90:
                 self.pairing = False
-                self.pair_button.configure(state='normal')
-                self.status.set('Pairing timed out; please check Wuwa Tappo.')
+                self.ui.set_pairing(False)
+                self.set_status('Pairing timed out; please check Wuwa Tappo.', 'error')
         while not self.messages.empty():
             event, data = self.messages.get()
             if event == 'show':
@@ -400,17 +385,19 @@ class TrayApp:
                 return
             elif event == 'paired':
                 self.session_generation += 1
-                self.status.set('Pairing successful. Click Enable Auto-Claim to start.')
+                self.ui.set_pairing(False)
+                self.set_status('Pairing successful. Click Enable Auto-Claim to start.', 'active')
             elif event == 'pair_error':
-                self.status.set(data.get('detail', 'Pairing failed.'))
+                self.ui.set_pairing(False)
+                self.set_status(data.get('detail', 'Pairing failed.'), 'error')
             elif event == 'status':
                 self.countdowns = (time.monotonic(), data['left'], data['right'])
                 self.server_balance = data['balance']
-                self.balance.set(f"Available server clicks: {self.server_balance:,}")
+                self.ui.set_available_clicks(self.server_balance)
                 if self.tappo_click_sync_pending and not self.tappo_click_sync_inflight:
                     self.sync_tappo_click_state(data['gross'], data['consumed'])
                 if self.active.is_set() and not self.ui_sync_warned:
-                    self.status.set('Waiting for server cooldown...')
+                    self.set_status('Waiting for server cooldown...')
             elif event == 'tappo_click_sync_result':
                 if data['generation'] == self.tappo_click_sync_generation:
                     self.tappo_click_sync_inflight = False
@@ -419,66 +406,72 @@ class TrayApp:
                     elif not data['success']:
                         self.log.warning('Could not update Tappo click display without reloading.')
             elif event == 'need_clicks' and self.active.is_set():
-                self.status.set('Not enough clicks (need >= 1,000). Keep clicking in the app.')
+                self.set_status('Not enough clicks (need >= 1,000). Keep clicking in the app.')
             elif event == 'ui_sync_unavailable':
                 self.ui_sync_warned = True
                 if not self.ui_restart_attempted and not self.ui_restart_running:
-                    self.status.set('Tappo UI sync is unavailable; restarting Tappo automatically...')
+                    self.set_status('Tappo UI sync is unavailable; restarting Tappo automatically...')
                     self.root.after(100, lambda: self.start_tappo_restart(automatic=True))
                 else:
-                    self.status.set('Tappo UI sync is unavailable. Click Re-sync Tappo UI to try again.')
+                    self.set_status('Tappo UI sync is unavailable. Click Re-sync Tappo UI to try again.')
             elif event == 'ui_sync_available':
                 self.ui_sync_warned = False
                 self.ui_restart_attempted = False
                 if self.active.is_set():
-                    self.status.set('Tappo interface synchronized; waiting for server cooldown...')
+                    self.set_status('Tappo interface synchronized; waiting for server cooldown...')
             elif event == 'ui_sync_restart_succeeded':
                 self.ui_sync_failure.clear()
                 self.ui_restart_running = False
                 self.ui_restart_attempted = False
-                self.restart_button.configure(state='normal')
+                self.ui.set_resyncing(False)
                 self.ui_sync_warned = False
-                self.status.set(data.get('detail', 'Tappo interface synchronized.'))
+                self.set_status(data.get('detail', 'Tappo interface synchronized.'))
             elif event == 'ui_sync_restart_failed':
                 self.ui_restart_running = False
-                self.restart_button.configure(state='normal')
+                self.ui.set_resyncing(False)
                 self.ui_sync_warned = True
-                self.status.set(data.get('detail', 'Could not synchronize Tappo. Click Re-sync Tappo UI to try again.'))
+                self.set_status(data.get('detail', 'Could not synchronize Tappo. Click Re-sync Tappo UI to try again.'))
             elif event == 'claimed':
                 self.claim_count += 1
                 self.tappo_claim_generation += 1
                 self.tappo_click_sync_pending = True
                 if self.server_balance is not None:
                     self.server_balance = max(0, self.server_balance - 1000)
-                    self.balance.set(f"Available server clicks: {self.server_balance:,} (refreshing from server...)")
+                    self.ui.set_available_clicks(self.server_balance)
                 self.wake.set()
                 kind = {'character_skin': 'Character', 'accessory': 'Accessory', 'emote': 'Emote'}.get(data.get('asset_type'), 'New Item')
-                self.latest.set(f'Claimed {self.claim_count} chest(s) in this session • {kind}')
-                self.status.set('Chest claimed; syncing clicks and chest display without reloading...')
+                rarity = str(data.get('rarity', '')).strip().lower()
+                if rarity in self.rarity_counts:
+                    self.rarity_counts[rarity] += 1
+                self.ui.set_claimed(self.claim_count, **self.rarity_counts)
+                slot = {'left': 'Left chest', 'right': 'Right chest'}.get(data.get('slot'), 'Chest')
+                item_name = str(data.get('asset_name', '')).strip()
+                detail = f'{slot} · {item_name}' if item_name else slot
+                self.ui.set_last_claim(rarity or None, kind, detail)
+                self.set_status('Chest claimed; syncing clicks and chest display without reloading...')
                 self.sync_chests(after_claim=True)
             elif event == 'app_closed':
-                self.status.set('Waiting for Wuwa Tappo to open...')
+                self.set_status('Waiting for Wuwa Tappo to open...')
             elif event == 'auth_needed':
                 self.set_enabled(False)
-                self.status.set('Session expired or account changed. Please re-pair.')
+                self.set_status('Session expired or account changed. Please re-pair.')
             elif event == 'claim_rejected':
-                self.status.set(f"Server returned code {data['code']}; waiting before retry.")
+                self.set_status(f"Server returned code {data['code']}; waiting before retry.")
             elif event == 'claim_uncertain':
-                self.status.set('Claim status uncertain; checking server before retrying.')
+                self.set_status('Claim status uncertain; checking server before retrying.')
             elif event == 'network_error':
-                self.status.set('Connection error. Tool will retry automatically with backoff.')
+                self.set_status('Connection error. Tool will retry automatically with backoff.')
             elif event in ('api_error', 'internal_error'):
-                self.status.set('Data temporarily unavailable. Check activity log.')
+                self.set_status('Data temporarily unavailable. Check activity log.')
         if self.countdowns:
             elapsed = time.monotonic() - self.countdowns[0]
             def fmt(value):
                 seconds = max(0, int(value - elapsed + 0.999))
                 return 'Ready' if seconds == 0 else f'{seconds // 60:02d}:{seconds % 60:02d}'
-            self.left.set(fmt(self.countdowns[1]))
-            self.right.set(fmt(self.countdowns[2]))
+            self.ui.set_timers(fmt(self.countdowns[1]), fmt(self.countdowns[2]))
         self.status_data = {
             'enabled': self.active.is_set(),
-            'status': self.status.get(),
+            'status': self.status_text,
             'claims_this_session': self.claim_count,
             'updated_at': time.time(),
             'window_height': self.root.winfo_height(),
@@ -503,7 +496,7 @@ class TrayApp:
             finally:
                 self.ui_exit_sync_done.set()
         threading.Thread(target=restore_chests_before_exit, name='tappo-ui-restore', daemon=True).start()
-        self.status.set('Finishing current request before exit...')
+        self.set_status('Finishing current request before exit...')
         def finish():
             if self.thread.is_alive() or not self.ui_exit_sync_done.is_set():
                 self.root.after(200, finish)
