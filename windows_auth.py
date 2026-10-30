@@ -7,8 +7,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import subprocess
 import time
+import winreg
 
 DATA_DIR = Path(os.environ['LOCALAPPDATA']) / 'WuwaTappoAutoClaim'
 PROFILE = Path(os.environ['LOCALAPPDATA']) / 'com.kuro.wuwatappo.global' / 'EBWebView'
@@ -97,9 +97,26 @@ def find_app_exe() -> Path | None:
         Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'WuwaTappoGlobal' / 'WuwaTappo.exe',
         Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'WuwaTappoGlobal' / 'WuwaTappo.exe',
     ]
+
+    # Prefer the installer-registered path when Tappo was installed to a custom folder.
+    app_path_key = r'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WuwaTappo.exe'
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (0, getattr(winreg, 'KEY_WOW64_32KEY', 0), getattr(winreg, 'KEY_WOW64_64KEY', 0)):
+            try:
+                with winreg.OpenKey(hive, app_path_key, 0, winreg.KEY_READ | view) as key:
+                    registered, _ = winreg.QueryValueEx(key, None)
+                if isinstance(registered, str):
+                    candidates.append(Path(os.path.expandvars(registered.strip().strip('"'))))
+            except (FileNotFoundError, OSError):
+                continue
+
     for c in candidates:
-        if c.exists():
-            return c
+        try:
+            resolved = c.expanduser().resolve(strict=True)
+            if resolved.is_file():
+                return resolved
+        except (OSError, RuntimeError):
+            continue
     return None
 
 def pair_existing_session():
@@ -109,11 +126,15 @@ def pair_existing_session():
         raise AuthError('Pairing requires Administrator privileges to restart Wuwa Tappo.')
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     status = DATA_DIR / 'pair-status.json'
-    def record(state, detail=''):
-        status.write_text(json.dumps({'state': state, 'detail': detail, 'at': time.time()}), encoding='utf-8')
+    def record(state, detail='', app_exe=None):
+        status.write_text(json.dumps({
+            'state': state,
+            'detail': detail,
+            'app_exe': str(app_exe) if app_exe else '',
+            'at': time.time(),
+        }), encoding='utf-8')
     record('pairing')
     roots = []
-    stopped = False
     app_exe_path = None
     try:
         for proc in psutil.process_iter(['name', 'exe']):
@@ -133,7 +154,6 @@ def pair_existing_session():
         if roots:
             # The app persists pending clicks every five seconds.
             time.sleep(5.5)
-            stopped = True
             for proc in roots:
                 proc.terminate()
             psutil.wait_procs(roots, timeout=5)
@@ -148,18 +168,14 @@ def pair_existing_session():
         save_session(token)
         from ui_sync import ensure_webview2_cdp_env
         ensure_webview2_cdp_env()
-        record('paired')
+        record('paired', app_exe=app_exe_path)
     except AuthError as exc:
-        record('error', str(exc))
+        record('error', str(exc), app_exe=app_exe_path)
         raise
     except Exception:
-        record('error', 'Could not read login session; please try pairing again.')
+        record(
+            'error',
+            'Could not read login session; please try pairing again.',
+            app_exe=app_exe_path,
+        )
         raise AuthError('Could not read login session; please try pairing again.') from None
-    finally:
-        if stopped and app_exe_path and app_exe_path.exists():
-            try:
-                run_env = os.environ.copy()
-                run_env['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = '--remote-debugging-port=9222'
-                subprocess.Popen([str(app_exe_path)], cwd=str(app_exe_path.parent), env=run_env)
-            except Exception:
-                record('restart-error', 'Pairing complete. Please reopen Wuwa Tappo.')

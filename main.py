@@ -19,11 +19,11 @@ from PIL import Image
 
 from chest_autoclaim_ui import ChestAutoClaimUI
 
-from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session
+from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session, find_app_exe
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
-from ui_sync import set_chests_hidden, set_tappo_click_state, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
+from ui_sync import set_chests_hidden, set_tappo_click_state, deduct_tappo_clicks, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync, launch_tappo_process
 
-VERSION = '1.1.1'
+VERSION = '1.1.6'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -68,6 +68,49 @@ def configure_log():
     log.addHandler(handler)
     return log
 
+def elevate_before_start():
+    """Run the helper with a full Administrator token before touching Tappo."""
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return 'continue'
+    except Exception:
+        pass
+
+    executable = sys.executable
+    if getattr(sys, 'frozen', False):
+        parameters = subprocess.list2cmdline(sys.argv[1:])
+        working_directory = str(Path(executable).resolve().parent)
+    else:
+        script = str(Path(__file__).resolve())
+        parameters = subprocess.list2cmdline([script, *sys.argv[1:]])
+        working_directory = str(Path(script).parent)
+
+    try:
+        shell = ctypes.WinDLL('shell32', use_last_error=True)
+        shell.ShellExecuteW.argtypes = [
+            wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+            wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int,
+        ]
+        shell.ShellExecuteW.restype = ctypes.c_void_p
+        result = shell.ShellExecuteW(
+            None, 'runas', executable, parameters, working_directory, 1
+        )
+        if result and result > 32:
+            return 'relaunched'
+        error = ctypes.get_last_error() or int(result or 0)
+    except Exception as exc:
+        error = getattr(exc, 'winerror', None) or ctypes.get_last_error()
+
+    if error == 1223:
+        message = 'Administrator permission was cancelled. Run WuwaTappoAutoClaim again and choose Yes in the Windows prompt.'
+    else:
+        message = f'WuwaTappoAutoClaim could not request Administrator permission (Windows error {error or "unknown"}).'
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, 'Wuwa Tappo Auto-Claim', 0x10)
+    except Exception:
+        pass
+    return 'failed'
+
 class TrayApp:
     def __init__(self, enabled=False, minimized=False):
         ensure_webview2_cdp_env()
@@ -84,6 +127,7 @@ class TrayApp:
         self.claim_count = 0
         self.countdowns = None
         self.server_balance = None
+        self.last_server_click_totals = None
         self.status_data = {}
         self.ui_sync_warned = False
         self.ui_restart_attempted = False
@@ -209,11 +253,26 @@ class TrayApp:
                 self.messages.put(('ui_sync_unavailable', {}))
         threading.Thread(target=run, name='tappo-ui-sync', daemon=True).start()
 
+    def deduct_clicks_ui(self, amount=1000):
+        def run():
+            success = deduct_tappo_clicks(amount, timeout=3.0)
+            if success:
+                self.log.info('Immediate Tappo click deduction applied once (%s clicks).', amount)
+            else:
+                self.log.warning('Immediate Tappo click deduction could not be confirmed (%s clicks).', amount)
+        threading.Thread(target=run, name='tappo-click-deduct', daemon=True).start()
+
     def sync_tappo_click_state(self, gross, consumed):
         self.tappo_click_sync_generation += 1
         generation = self.tappo_click_sync_generation
         claim_generation = self.tappo_claim_generation
         self.tappo_click_sync_inflight = True
+        self.log.info(
+            'Tappo click display sync requested (server gross=%s consumed=%s available=%s)',
+            gross,
+            consumed,
+            max(0, gross - consumed),
+        )
 
         def run():
             with self.tappo_click_sync_lock:
@@ -285,14 +344,21 @@ class TrayApp:
         self.set_status('Pairing in progress; Wuwa Tappo will restart...', 'waiting')
         executable = sys.executable
         args = ['--pair'] if getattr(sys, 'frozen', False) else [str(Path(__file__).resolve()), '--pair']
-        shell = ctypes.WinDLL('shell32', use_last_error=True)
-        shell.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int]
-        shell.ShellExecuteW.restype = ctypes.c_void_p
-        result = shell.ShellExecuteW(None, 'runas', executable, subprocess.list2cmdline(args), None, 0)
-        if not result or result <= 32:
+        try:
+            subprocess.Popen(
+                [executable, *args],
+                cwd=str(Path(executable).resolve().parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+        except OSError as exc:
             self.pairing = False
             self.ui.set_pairing(False)
-            self.set_status('Could not launch elevated pairing process.', 'error')
+            code = getattr(exc, 'winerror', None) or getattr(exc, 'errno', None)
+            detail = f'Windows error {code}: {exc.strerror}' if code else type(exc).__name__
+            self.set_status(f'Could not start pairing ({detail}).', 'error')
 
     def reset_client(self):
         if self.client:
@@ -386,14 +452,37 @@ class TrayApp:
             elif event == 'paired':
                 self.session_generation += 1
                 self.ui.set_pairing(False)
-                self.set_status('Pairing successful. Click Enable Auto-Claim to start.', 'active')
+                app_exe_str = data.get('app_exe') or data.get('detail')
+                app_exe = Path(app_exe_str) if app_exe_str else find_app_exe()
+                if app_exe and app_exe.is_file() and not app_running():
+                    launched, detail = launch_tappo_process(app_exe)
+                    if not launched:
+                        self.set_status(f'Pairing successful, but Wuwa Tappo did not reopen: {detail}', 'error')
+                    else:
+                        self.set_status('Pairing successful. Click Enable Auto-Claim to start.', 'active')
+                else:
+                    self.set_status('Pairing successful. Click Enable Auto-Claim to start.', 'active')
             elif event == 'pair_error':
                 self.ui.set_pairing(False)
-                self.set_status(data.get('detail', 'Pairing failed.'), 'error')
+                app_exe_str = data.get('app_exe')
+                app_exe = Path(app_exe_str) if app_exe_str else None
+                restart_note = ''
+                if app_exe and app_exe.is_file() and not app_running():
+                    launched, launch_detail = launch_tappo_process(app_exe)
+                    if not launched:
+                        restart_note = f' Wuwa Tappo also failed to reopen: {launch_detail}'
+                self.set_status(data.get('detail', 'Pairing failed.') + restart_note, 'error')
             elif event == 'status':
                 self.countdowns = (time.monotonic(), data['left'], data['right'])
                 self.server_balance = data['balance']
                 self.ui.set_available_clicks(self.server_balance)
+                click_totals = (data['gross'], data['consumed'])
+                if click_totals != self.last_server_click_totals:
+                    self.last_server_click_totals = click_totals
+                    self.log.info(
+                        'Server click totals received (gross=%s consumed=%s available=%s)',
+                        data['gross'], data['consumed'], data['balance'],
+                    )
                 if self.tappo_click_sync_pending and not self.tappo_click_sync_inflight:
                     self.sync_tappo_click_state(data['gross'], data['consumed'])
                 if self.active.is_set() and not self.ui_sync_warned:
@@ -403,9 +492,12 @@ class TrayApp:
                     self.tappo_click_sync_inflight = False
                     if data['success'] and data['claim_generation'] == self.tappo_claim_generation:
                         self.tappo_click_sync_pending = False
+                        self.log.info('Tappo click display sync confirmed.')
                     elif not data['success']:
                         self.log.warning(
-                            'Could not confirm the Tappo click display update; it will be retried.'
+                            'Could not confirm the Tappo click display update for server totals gross=%s consumed=%s; it will be retried.',
+                            self.last_server_click_totals[0] if self.last_server_click_totals else None,
+                            self.last_server_click_totals[1] if self.last_server_click_totals else None,
                         )
                         if self.tappo_click_sync_pending and self.active.is_set():
                             self.set_status('Tappo click display update is pending; retrying...')
@@ -442,6 +534,7 @@ class TrayApp:
                 if self.server_balance is not None:
                     self.server_balance = max(0, self.server_balance - 1000)
                     self.ui.set_available_clicks(self.server_balance)
+                self.deduct_clicks_ui(1000)
                 self.wake.set()
                 kind = {'character_skin': 'Character', 'accessory': 'Accessory', 'emote': 'Emote'}.get(data.get('asset_type'), 'New Item')
                 rarity = str(data.get('rarity', '')).strip().lower()
@@ -575,6 +668,11 @@ def main():
     return 0
 
 if __name__ == '__main__':
+    elevation = elevate_before_start()
+    if elevation == 'relaunched':
+        sys.exit(0)
+    if elevation != 'continue':
+        sys.exit(1)
     try:
         sys.exit(main())
     except Exception as exc:

@@ -3,10 +3,10 @@ setlocal
 title Build Wuwa Tappo Auto Claim
 cd /d "%~dp0"
 
-set "APP_ENTRY=source\main.py"
-set "REQ_FILE=source\requirements.txt"
-if not exist "%APP_ENTRY%" set "APP_ENTRY=main.py"
-if not exist "%REQ_FILE%" set "REQ_FILE=requirements.txt"
+set "APP_ENTRY=main.py"
+set "REQ_FILE=requirements.txt"
+if not exist "%APP_ENTRY%" set "APP_ENTRY=source\main.py"
+if not exist "%REQ_FILE%" set "REQ_FILE=source\requirements.txt"
 
 echo ========================================================
 echo   Building Wuwa Tappo Auto Claim with PyInstaller
@@ -48,7 +48,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -m PyInstaller --onedir --windowed --name "WuwaTappoAutoClaim" --clean --noconfirm --icon "Zani.ico" --add-data "Zani.png;." "%APP_ENTRY%"
+python -m PyInstaller --onedir --windowed --uac-admin --name "WuwaTappoAutoClaim" --clean --noconfirm --icon "Zani.ico" --add-data "Zani.png;." "%APP_ENTRY%"
 if errorlevel 1 (
     echo [ERROR] Build failed.
     pause

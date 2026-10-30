@@ -2,7 +2,7 @@
 
 An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after the server says its cooldown has ended. It does not shorten or bypass the server cooldown.
 
-**Latest release:** [WuwaTappoAutoClaim-v1.1.1.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.1/WuwaTappoAutoClaim-v1.1.1.zip)
+**Latest release:** [WuwaTappoAutoClaim-v1.1.6.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.6/WuwaTappoAutoClaim-v1.1.6.zip)
 
 **License:** [MIT](LICENSE)
 
@@ -20,19 +20,61 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 ## Requirements
 
 - Windows 10 or 11, 64-bit.
+- The same Windows account that runs Wuwa Tappo must be an Administrator and approve the UAC prompt when starting the helper. Elevating with credentials from a different account uses a different Windows profile and cannot read the Tappo session.
 - Wuwa Tappo installed, open, and logged into the intended account.
 - Internet access and at least 1,000 eligible clicks recorded by the service for each claim.
 - Keep the PC awake and Wuwa Tappo running while waiting. The helper does not run while the PC is shut down or asleep.
 
 ## Install and run the prebuilt app
 
-1. Download `WuwaTappoAutoClaim-v1.1.1.zip` from the [v1.1.1 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.1).
+1. Download `WuwaTappoAutoClaim-v1.1.6.zip` from the [v1.1.6 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.6).
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
-4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
+4. Run `WuwaTappoAutoClaim.exe` and approve the Administrator prompt each time it starts. Choose **Re-pair Session** if needed. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
 5. Choose **Enable Auto-Claim**. If UI sync is unavailable, the helper automatically waits for Tappo to save pending clicks, then restarts it once with the WebView2 setting needed for UI synchronization. Use **Re-sync Tappo UI** to try again; it first checks the live connection and only restarts Tappo if needed. Close or minimize the dashboard to keep the helper in the notification area.
 
 You can instead run `Run-Background.vbs` to start minimized with auto-claim enabled. Use **Exit** in the tray menu or `Stop-Tool.vbs` to stop it. It is not added to Windows Startup or Task Scheduler; launch it again after a Windows restart.
+
+## Version 1.1.6
+
+- Apply the immediate 1,000-click display deduction only to a loaded Tappo dashboard with its click store ready; auxiliary WebViews no longer cause repeated deductions while retries run.
+- Attach an in-memory claim ID to the deduction and make retries idempotent, so one successful claim is reflected only once.
+- Log whether the immediate display deduction was applied or could not be confirmed.
+
+## Version 1.1.5 (local test build)
+
+- Keep v1.1.3's API User-Agent identifier while retaining the v1.1.4 UI confirmation fixes.
+- Refuse to overwrite Tappo's cumulative click totals with impossible or lower server totals, preventing a stale zero response from resetting an existing counter.
+- Record server gross/consumed/available totals and whether Tappo confirmed the display update in `activity.log`.
+
+This package has not been published as a GitHub Release.
+
+## Version 1.1.4
+
+- Verify chest hiding and click counts against ready dashboard WebViews, ignoring Tappo pages that have not finished loading or do not contain the dashboard.
+- Treat the injected chest stylesheet as effective even when no chest anchor is currently rendered, so future chest controls are hidden without a false restart failure.
+- Check the click total on the dashboard node itself as well as its text children, and accept rounded compact counters such as `1.2K` within their displayed precision.
+
+This is a local test build and has not been published as a GitHub Release.
+
+## Version 1.1.3
+
+- Fix the v1.1.2 elevated restart path: WebView2 ignores per-user environment and HKCU debugging overrides when its host is elevated, which left Tappo open without a CDP endpoint.
+- Temporarily set an app-specific HKLM WebView2 debugging policy for `WuwaTappo.exe`, then restore the exact previous registry value after UI sync or a failed launch. A recovery marker allows restoration after an interrupted restart.
+- Keep the debugging argument in the helper's process environment instead of adding it permanently to the user's Windows environment.
+- Report whether Tappo exited, WebView2 received the debugging flag, or the endpoint failed to expose the dashboard.
+
+This package has not been published as a GitHub Release.
+
+## Version 1.1.2
+
+- Require Administrator permission at startup, including source runs, so process restart and UI synchronization use a consistent Windows permission level.
+- Reuse the elevated helper process for session pairing instead of opening another UAC flow. Record the installed Tappo path and reopen Tappo after pairing, including when pairing fails.
+- Improve installed-app lookup and restart error details so missing paths, denied stops, and failed relaunches report the Windows error.
+- Confirm chest controls are actually hidden in the live dashboard and that Tappo's displayed click count matches the server-confirmed value before reporting success.
+- Rebuild the portable ZIP from the current source so the EXE includes the same chest and click synchronization code as the source tree.
+
+This is a local test build and has not been published as a GitHub Release.
 
 ## Version 1.1.1
 
@@ -60,7 +102,7 @@ Wuwa Tappo's service creates a chest after its 30-minute active-time cycle. Clai
 
 The helper reads only the `kuro_infoToken` session cookie in Wuwa Tappo's own WebView2 profile when you choose to pair. It does not read Chrome, Edge, or Firefox profiles and does not store your password. The saved session is protected with Windows DPAPI for the current Windows account. API requests go to the Wuwa Tappo service configured in the source; logs omit session tokens and authorization headers. Tool data is stored under `%LOCALAPPDATA%\WuwaTappoAutoClaim`.
 
-**WebView2 debugging notice:** To hide and restore the chest controls and refresh the in-app click display, the helper sets the per-user `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` environment variable to enable WebView2 remote debugging on port `9222`. If UI sync is unavailable when you enable Auto-Claim, the helper waits 5.5 seconds for pending clicks to save, then restarts Tappo once automatically. The **Re-sync Tappo UI** button checks the current connection first and restarts Tappo only when needed; the endpoint is intended for local access and has no login of its own. Other software running on your PC may be able to connect while Wuwa Tappo is open. Review `ui_sync.py` (or `source/ui_sync.py` in the nested source layout) before using this feature, and do not run untrusted software alongside it. The setting remains in your Windows user environment after the helper exits; remove only the added `--remote-debugging-port=9222` argument from that variable if you no longer want it enabled. Existing arguments may belong to other software.
+**WebView2 debugging notice:** To hide/restore chest controls and refresh Tappo's click display, the helper enables WebView2 remote debugging on port `9222`. On an elevated restart, it temporarily writes an app-specific value under `HKLM\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`, then restores the previous value after synchronization or a failed launch. A recovery marker is stored under `%LOCALAPPDATA%\WuwaTappoAutoClaim` if the helper is interrupted during restart. The debugging endpoint has no login of its own, so other software running locally may connect while Tappo is open. Review `ui_sync.py` before using this feature, and do not run untrusted software alongside it. The service may change or restrict its undocumented interfaces, so UI sync can stop working after a Tappo or WebView2 update.
 
 The prebuilt executable is not code-signed. Review the source and release checksum before running it. This project is independent and is not affiliated with, endorsed by, or sponsored by KURO GAMES or Irox Games. The service may change or restrict its undocumented interfaces, so the helper may stop working. Use it in accordance with the app's applicable rules.
 
