@@ -2,7 +2,7 @@
 
 An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after the server says its cooldown has ended. It does not shorten or bypass the server cooldown.
 
-**Latest release:** [WuwaTappoAutoClaim-v1.1.6.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.6/WuwaTappoAutoClaim-v1.1.6.zip)
+**Latest release:** [WuwaTappoAutoClaim-v1.2.2.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.2.2/WuwaTappoAutoClaim-v1.2.2.zip)
 
 **License:** [MIT](LICENSE)
 
@@ -13,6 +13,8 @@ An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after th
 - Processes the two chest slots one at a time and records outcomes locally to avoid repeating a successful claim.
 - Shows chest timers, server clicks, session claim totals, rarity counts, and the latest reward in a refreshed Windows dashboard. You can pause or resume, re-pair, open the activity log, re-sync Tappo, minimize to the tray, or exit.
 - Hides chest controls while auto-claim is active and updates Tappo's displayed click balance from the server after a claim, without reloading the page.
+- Optional **Click when idle** starts after 15 seconds without keyboard or mouse input, stops as soon as user input resumes, and starts a fresh idle period after activity. Only a continuous long idle stretch is capped at 1,000 F15 presses followed by a 5-minute cooldown. Automatic F15 timing varies randomly. F15 goes to the foreground app.
+- Settings includes **Add 1000 clicks**, which sends 1,000 F15 presses 0.15 seconds apart and disables its button until the batch completes.
 - Uses the server's response time and a monotonic timer, so changing the Windows clock does not make a chest ready sooner.
 
 The service remains authoritative. It may reject a claim during cooldown, after a session expires, or when the server has not recorded enough clicks. The helper backs off and checks again. It polls at intervals of up to about 30 seconds, so a claim can happen a few seconds later than the exact deadline.
@@ -27,13 +29,46 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Download `WuwaTappoAutoClaim-v1.1.6.zip` from the [v1.1.6 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.6).
+1. Download `WuwaTappoAutoClaim-v1.2.2.zip` from the [v1.2.2 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.2.2).
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe` and approve the Administrator prompt each time it starts. Choose **Re-pair Session** if needed. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
 5. Choose **Enable Auto-Claim**. If UI sync is unavailable, the helper automatically waits for Tappo to save pending clicks, then restarts it once with the WebView2 setting needed for UI synchronization. Use **Re-sync Tappo UI** to try again; it first checks the live connection and only restarts Tappo if needed. Close or minimize the dashboard to keep the helper in the notification area.
 
 You can instead run `Run-Background.vbs` to start minimized with auto-claim enabled. Use **Exit** in the tray menu or `Stop-Tool.vbs` to stop it. It is not added to Windows Startup or Task Scheduler; launch it again after a Windows restart.
+
+When a newer helper version starts, it asks older running helper processes to close and waits for them before opening its dashboard. If an older process is unresponsive, the new version closes that identified helper process before continuing. If the same or a newer version is already running, the new launch brings its existing window forward instead of starting a duplicate.
+
+## Version 1.2.2
+
+- Show the 15-second idle click explanation as a tooltip when hovering over **Click when idle**; restore the general footer notice.
+- Increase the **Add 1000 clicks** interval from 0.05 to 0.15 seconds between presses.
+- Vary the automatic F15 timing randomly between idle presses.
+
+## Version 1.2.1 (local test build)
+
+- On launch, close an older running helper before starting this version; if this or a newer version is already running, show its window instead of creating a duplicate.
+- Coordinate near-simultaneous launches so they do not stop each other during an upgrade.
+- Reset the idle click batch and its 5-minute cooldown when keyboard or mouse input resumes. A new batch starts only after the next 15 seconds of inactivity.
+
+This package has not been published as a GitHub Release.
+
+## Version 1.2.0 (local test build)
+
+- Limit **Click when idle** to 1,000 F15 presses per long idle stretch, then pause for 5 minutes.
+- Add **Add 1000 clicks** under Settings. Its Add button stays disabled while 1,000 F15 presses are sent at 0.05-second start-to-start intervals.
+- Replace the idle explanation in the main window with the requested 15-second, 1,000-click, 5-minute-cooldown sentence.
+
+This package has not been published as a GitHub Release.
+
+## Version 1.1.7 (local test build)
+
+- Add a **Click when idle** toggle beside the three main action buttons; green means on and gray means off.
+- When enabled, send F15 after 15 seconds without keyboard or mouse input until user input resumes.
+- Save the toggle state across restarts and stop the worker cleanly when the helper exits.
+- F15 is sent to the foreground application; disable the option if that application uses F15.
+
+This package has not been published as a GitHub Release.
 
 ## Version 1.1.6
 

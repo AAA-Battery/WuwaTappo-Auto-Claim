@@ -8,7 +8,7 @@ Layout (top -> bottom):
     Status pill  : current state of the auto-claimer
     Timer cards  : LEFT CHEST | RIGHT CHEST
     Stats card   : available server clicks | claimed this session
-    Actions      : Pause Auto-Claim (primary) | Re-pair Session | Minimize to Tray
+    Actions      : Pause Auto-Claim | Re-pair Session | Minimize to Tray | Click when idle
     Note         : informational text
     Footer       : [gear] Settings (bottom-left) ........ Exit (bottom-right)
 
@@ -182,7 +182,7 @@ def enable_dark_titlebar(window):
 # Settings dialog
 # ---------------------------------------------------------------------------
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master, on_open_log, on_resync):
+    def __init__(self, master, on_open_log, on_resync, on_add_clicks):
         super().__init__(master)
         self.title("Settings")
         self.configure(bg=BG)
@@ -202,6 +202,11 @@ class SettingsDialog(tk.Toplevel):
         self._resync_button = self._row(
             body, "Re-sync Tappo UI",
             "Reload timers and state from Wuwa Tappo.", "Re-sync", on_resync
+        )
+        self._add_clicks_button = self._row(
+            body, "Add 1000 clicks",
+            "Send 1,000 F15 presses with 0.15-second spacing.",
+            "Add", on_add_clicks,
         )
 
         tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(16, 12))
@@ -244,6 +249,10 @@ class SettingsDialog(tk.Toplevel):
     def set_resyncing(self, resyncing):
         self._resync_button.set_enabled(not resyncing)
 
+    def set_add_clicks_running(self, running):
+        self._add_clicks_button.configure(text="Adding..." if running else "Add")
+        self._add_clicks_button.set_enabled(not running)
+
     def close(self):
         self.grab_release()
         self.destroy()
@@ -254,7 +263,8 @@ class SettingsDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 class ChestAutoClaimUI:
     def __init__(self, root, on_toggle_pause=None, on_repair=None,
-                 on_minimize=None, on_open_log=None, on_resync=None, on_exit=None):
+                 on_minimize=None, on_open_log=None, on_resync=None, on_exit=None,
+                 on_toggle_idle_click=None, on_add_clicks=None):
         self.root = root
         self.on_toggle_pause = on_toggle_pause
         self.on_repair = on_repair
@@ -262,16 +272,19 @@ class ChestAutoClaimUI:
         self.on_open_log = on_open_log
         self.on_resync = on_resync
         self.on_exit = on_exit
+        self.on_toggle_idle_click = on_toggle_idle_click
+        self.on_add_clicks = on_add_clicks
         self.enabled = False
         self.paused = False
         self.pairing = False
         self.resyncing = False
+        self.add_clicks_running = False
         self._settings = None
 
         root.title("Wuwa Tappo \u2022 Chest Auto-Claim")
         root.configure(bg=BG)
-        root.geometry("640x600")
-        root.minsize(560, 540)
+        root.geometry("720x600")
+        root.minsize(680, 540)
         # Closing the window minimizes to tray (same as the button).
         root.protocol("WM_DELETE_WINDOW", self._minimize)
 
@@ -371,19 +384,27 @@ class ChestAutoClaimUI:
     def _build_actions(self, parent):
         row = tk.Frame(parent, bg=BG)
         row.pack(fill="x")
-        row.columnconfigure((0, 1, 2), weight=1, uniform="actions")
+        row.columnconfigure((0, 1, 2, 3), weight=1, uniform="actions")
         self._pause_btn = HoverButton(row, "Pause Auto-Claim", self._toggle_pause, "primary")
         self._pause_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
         self._repair_btn = HoverButton(row, "Re-pair Session", self._call(lambda: self.on_repair))
         self._repair_btn.grid(row=0, column=1, sticky="ew", padx=5)
         HoverButton(row, "Minimize to Tray", self._minimize).grid(
-            row=0, column=2, sticky="ew", padx=(5, 0))
+            row=0, column=2, sticky="ew", padx=5)
+        self._idle_click_btn = HoverButton(
+            row, "Click when idle", self._toggle_idle_click, "secondary"
+        )
+        self._idle_click_btn.grid(row=0, column=3, sticky="ew", padx=(5, 0))
+        Tooltip(
+            self._idle_click_btn,
+            "When inactive for 15 seconds, the application will automatically click 1000 times, with a 5-minute cooldown.",
+        )
 
     def _build_footer(self, parent):
         tk.Label(parent, justify="left", anchor="w", bg=BG, fg=SUBTLE, font=(FONT, 9),
                  text="Keep Wuwa Tappo running. Never changes system time or fabricates clicks.\n"
                       "Closing this window minimizes to the system tray."
-                 ).pack(fill="x", pady=(8, 4))
+                 , wraplength=650).pack(fill="x", pady=(8, 4))
         tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", pady=(0, 12))
 
         footer = tk.Frame(parent, bg=BG)
@@ -426,8 +447,10 @@ class ChestAutoClaimUI:
             self.root,
             on_open_log=self._call(lambda: self.on_open_log),
             on_resync=self._call(lambda: self.on_resync),
+            on_add_clicks=self._call(lambda: self.on_add_clicks),
         )
         self._settings.set_resyncing(self.resyncing)
+        self._settings.set_add_clicks_running(self.add_clicks_running)
 
     # ---- public API -------------------------------------------------------
     def set_status(self, text, state="waiting"):
@@ -478,6 +501,13 @@ class ChestAutoClaimUI:
             label = "Enable Auto-Claim"
         self._pause_btn.configure(text=label)
 
+    def set_click_when_idle(self, enabled):
+        self._idle_click_btn.set_variant("primary" if enabled else "secondary")
+
+    def _toggle_idle_click(self):
+        if self.on_toggle_idle_click:
+            self.on_toggle_idle_click()
+
     def set_pairing(self, pairing):
         self.pairing = bool(pairing)
         self._repair_btn.set_enabled(not self.pairing)
@@ -487,4 +517,9 @@ class ChestAutoClaimUI:
         self.resyncing = bool(resyncing)
         if self._settings and self._settings.winfo_exists():
             self._settings.set_resyncing(self.resyncing)
+
+    def set_add_clicks_running(self, running):
+        self.add_clicks_running = bool(running)
+        if self._settings and self._settings.winfo_exists():
+            self._settings.set_add_clicks_running(running)
 

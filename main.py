@@ -8,12 +8,14 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
+from datetime import datetime
 import pystray
 from PIL import Image
 
@@ -22,11 +24,14 @@ from chest_autoclaim_ui import ChestAutoClaimUI
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session, find_app_exe
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
 from ui_sync import set_chests_hidden, set_tappo_click_state, deduct_tappo_clicks, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync, launch_tappo_process
+from idle_activity import MANUAL_CLICK_INTERVAL_SECONDS, run_idle_activity, add_f15_clicks
 
-VERSION = '1.1.6'
+VERSION = '1.2.2'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
+STATUS_FILE = DATA_DIR / 'status.json'
+STARTUP_MUTEX_NAME = 'Local\\WuwaTappoAutoClaim-Startup-v1'
 
 def resource_path(name):
     """Find bundled resources in source runs and PyInstaller one-directory builds."""
@@ -41,8 +46,182 @@ def resource_path(name):
             return candidate
     raise FileNotFoundError(f'Bundled resource not found: {name}')
 
-def write_config(enabled):
-    CONFIG_FILE.write_text(json.dumps({'enabled': bool(enabled)}), encoding='utf8')
+def read_config():
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding='utf8'))
+        return config if isinstance(config, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def write_config(enabled=None, click_when_idle=None):
+    config = read_config()
+    if enabled is not None:
+        config['enabled'] = bool(enabled)
+    if click_when_idle is not None:
+        config['click_when_idle'] = bool(click_when_idle)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(config), encoding='utf8')
+    os.replace(temporary, CONFIG_FILE)
+
+def read_instance_status():
+    try:
+        value = json.loads(STATUS_FILE.read_text(encoding='utf8'))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def version_key(value):
+    try:
+        parts = tuple(int(part) for part in str(value).split('.'))
+        return parts + (0,) * max(0, 3 - len(parts))
+    except (TypeError, ValueError):
+        return ()
+
+def write_instance_status(value):
+    status = dict(value)
+    status.update(version=VERSION, pid=os.getpid(), updated_at=time.time())
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = STATUS_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(status, ensure_ascii=False), encoding='utf8')
+    os.replace(temporary, STATUS_FILE)
+
+def _current_session_id(pid):
+    session_id = wintypes.DWORD()
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel.ProcessIdToSessionId.restype = wintypes.BOOL
+    if not kernel.ProcessIdToSessionId(pid, ctypes.byref(session_id)):
+        return None
+    return int(session_id.value)
+
+def _running_helper_pids():
+    import psutil
+
+    current_session = _current_session_id(os.getpid())
+    if current_session is None:
+        return set()
+    pids = set()
+    for process in psutil.process_iter(['pid', 'name']):
+        try:
+            pid = int(process.info['pid'])
+            name = (process.info.get('name') or '').lower()
+            if pid == os.getpid() or name != 'wuwatappoautoclaim.exe':
+                continue
+            if _current_session_id(pid) == current_session:
+                pids.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, TypeError, ValueError):
+            continue
+
+    # Also recognize source-mode instances, but only trust a fresh status marker.
+    status = read_instance_status()
+    try:
+        pid = int(status.get('pid', 0))
+        fresh = 0 <= time.time() - float(status.get('updated_at', 0)) <= 3.0
+    except (TypeError, ValueError):
+        pid, fresh = 0, False
+    if fresh and pid and pid != os.getpid() and pid not in pids:
+        try:
+            process = psutil.Process(pid)
+            if (
+                current_session is not None
+                and _current_session_id(pid) == current_session
+                and process.name().lower() in ('python.exe', 'pythonw.exe')
+                and any(Path(arg).name.lower() == 'main.py' for arg in process.cmdline())
+            ):
+                pids.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    # New builds publish their PID/version heartbeat. Trust that PID even if a
+    # user renamed the EXE, while still limiting it to this Windows session.
+    status = read_instance_status()
+    try:
+        pid = int(status.get('pid', 0))
+        has_version = bool(version_key(status.get('version')))
+    except (TypeError, ValueError):
+        pid, has_version = 0, False
+    if has_version and pid and pid != os.getpid() and pid not in pids:
+        try:
+            if current_session is not None and _current_session_id(pid) == current_session:
+                psutil.Process(pid)
+                pids.add(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    return pids
+
+def _legacy_logged_version():
+    """Read the latest version banner written by a pre-handoff build."""
+    pattern = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+) .*Tool started v([0-9]+(?:\.[0-9]+)+)')
+    latest = None
+    for path in (DATA_DIR / 'activity.log', DATA_DIR / 'activity.log.1', DATA_DIR / 'activity.log.2'):
+        try:
+            lines = path.read_text(encoding='utf8', errors='replace').splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                continue
+            try:
+                stamp = datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S,%f').timestamp()
+            except ValueError:
+                continue
+            if latest is None or stamp > latest[0]:
+                latest = (stamp, match.group(2))
+    return latest[1] if latest else None
+
+def _running_instance_version(pids):
+    status = read_instance_status()
+    try:
+        pid = int(status.get('pid', 0))
+        version = status.get('version')
+        if pid in pids and version_key(version):
+            return str(version)
+    except (TypeError, ValueError):
+        pass
+    return _legacy_logged_version()
+
+def _stop_previous_helpers(grace_seconds=60.0):
+    import psutil
+
+    pids = _running_helper_pids()
+    if not pids:
+        return True
+
+    STOP_FILE.write_text('upgrade', encoding='ascii')
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not _running_helper_pids():
+            STOP_FILE.unlink(missing_ok=True)
+            return True
+        time.sleep(0.1)
+
+    # A legacy build may be hung and unable to process stop.flag. Close only
+    # helper processes identified in this Windows session, then let the new one run.
+    remaining = _running_helper_pids()
+    processes = []
+    for pid in remaining:
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+            processes.append(process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    _, alive = psutil.wait_procs(processes, timeout=4.0)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=3.0)
+    STOP_FILE.unlink(missing_ok=True)
+    return not alive and not _running_helper_pids()
+
+def show_startup_error(message):
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, 'Wuwa Tappo Auto-Claim', 0x10)
+    except Exception:
+        pass
 
 def app_running():
     import psutil
@@ -112,7 +291,7 @@ def elevate_before_start():
     return 'failed'
 
 class TrayApp:
-    def __init__(self, enabled=False, minimized=False):
+    def __init__(self, enabled=False, minimized=False, click_when_idle=False):
         ensure_webview2_cdp_env()
         self.log = configure_log()
         self.messages = queue.Queue()
@@ -140,6 +319,12 @@ class TrayApp:
         self.tappo_click_sync_lock = threading.Lock()
         self.ui_exit_sync_done = threading.Event()
         self.stopping = False
+        self.click_when_idle = bool(click_when_idle)
+        self.idle_click_stop = threading.Event()
+        self.idle_click_thread = None
+        self.add_clicks_running = False
+        self.add_click_stop = threading.Event()
+        self.add_click_thread = None
         self.root = tk.Tk()
         self.window_icon = tk.PhotoImage(file=str(resource_path('Zani.png')))
         self.root.iconphoto(True, self.window_icon)
@@ -153,8 +338,11 @@ class TrayApp:
             on_open_log=self.open_log_file,
             on_resync=self.prompt_tappo_restart,
             on_exit=self.quit,
+            on_toggle_idle_click=self.toggle_click_when_idle,
+            on_add_clicks=self.add_1000_clicks,
         )
         self.ui.set_auto_claim_state(False)
+        self.ui.set_click_when_idle(self.click_when_idle)
         self.ui.set_status(self.status_text, 'paused' if AUTH_FILE.exists() else 'error')
         self.ui.set_available_clicks(None)
         self.ui.set_claimed(0)
@@ -177,6 +365,8 @@ class TrayApp:
         
         self.thread = threading.Thread(target=self.worker, name='chest-worker', daemon=True)
         self.thread.start()
+        if self.click_when_idle:
+            self._start_idle_clicker()
         if enabled:
             self.set_enabled(True)
         if minimized:
@@ -235,6 +425,82 @@ class TrayApp:
         self.ui.set_auto_claim_state(enabled, paused=paused)
         self.tray.title = 'Wuwa Tappo • ' + ('Auto-Claim Active' if enabled else 'Paused')
         self.wake.set()
+
+    def toggle_click_when_idle(self):
+        if self.stopping:
+            return
+        self.click_when_idle = not self.click_when_idle
+        self.ui.set_click_when_idle(self.click_when_idle)
+        write_config(click_when_idle=self.click_when_idle)
+        if self.click_when_idle:
+            self._start_idle_clicker()
+            self.log.info('Click when idle enabled (F15 after 15 seconds without input).')
+        else:
+            self.idle_click_stop.set()
+            self.log.info('Click when idle disabled.')
+
+    def _start_idle_clicker(self):
+        if self.add_clicks_running:
+            return
+        if self.idle_click_thread and self.idle_click_thread.is_alive():
+            if not self.idle_click_stop.is_set():
+                return
+            self.idle_click_thread.join(timeout=0.25)
+            if self.idle_click_thread.is_alive():
+                return
+        self.idle_click_stop.clear()
+        self.idle_click_thread = threading.Thread(
+            target=self._run_idle_clicker,
+            name='click-when-idle',
+            daemon=True,
+        )
+        self.idle_click_thread.start()
+
+    def _run_idle_clicker(self):
+        try:
+            run_idle_activity(self.idle_click_stop)
+        except Exception:
+            self.log.exception('Click when idle stopped after an input error.')
+            self.messages.put(('idle_click_failed', {}))
+
+    def add_1000_clicks(self):
+        if self.stopping or self.add_clicks_running:
+            return
+        self.add_clicks_running = True
+        self.ui.set_add_clicks_running(True)
+        self.add_click_stop.clear()
+        self.idle_click_stop.set()
+        self.log.info(
+            'Manual F15 batch started (1000 presses, %.2f-second interval).',
+            MANUAL_CLICK_INTERVAL_SECONDS,
+        )
+        self.add_click_thread = threading.Thread(
+            target=self._run_manual_click_batch,
+            name='manual-1000-clicks',
+            daemon=True,
+        )
+        self.add_click_thread.start()
+
+    def _run_manual_click_batch(self):
+        completed = 0
+        error = None
+        try:
+            if self.idle_click_thread and self.idle_click_thread.is_alive():
+                self.idle_click_thread.join(timeout=1.0)
+            if self.idle_click_thread and self.idle_click_thread.is_alive():
+                raise RuntimeError('The idle click worker did not stop before the manual batch.')
+            completed = add_f15_clicks(
+                self.add_click_stop,
+                count=1000,
+                interval=MANUAL_CLICK_INTERVAL_SECONDS,
+            )
+        except Exception as exc:
+            error = str(exc) or type(exc).__name__
+            self.log.exception('Manual F15 batch stopped after %s presses.', completed)
+        self.messages.put((
+            'add_clicks_finished',
+            {'completed': completed, 'error': error},
+        ))
 
     def sync_chests(self, hidden=True, after_claim=False):
         def run():
@@ -501,6 +767,26 @@ class TrayApp:
                         )
                         if self.tappo_click_sync_pending and self.active.is_set():
                             self.set_status('Tappo click display update is pending; retrying...')
+            elif event == 'idle_click_failed':
+                self.click_when_idle = False
+                self.idle_click_stop.set()
+                write_config(click_when_idle=False)
+                self.ui.set_click_when_idle(False)
+            elif event == 'add_clicks_finished':
+                self.add_clicks_running = False
+                self.ui.set_add_clicks_running(False)
+                if data.get('error'):
+                    self.log.error(
+                        'Manual F15 batch stopped at %s/1000 presses: %s',
+                        data.get('completed', 0), data['error'],
+                    )
+                else:
+                    self.log.info(
+                        'Manual F15 batch completed (%s/1000 presses).',
+                        data.get('completed', 0),
+                    )
+                if self.click_when_idle and not self.stopping:
+                    self._start_idle_clicker()
             elif event == 'need_clicks' and self.active.is_set():
                 self.set_status('Not enough clicks (need >= 1,000). Keep clicking in the app.')
             elif event == 'ui_sync_unavailable':
@@ -570,12 +856,11 @@ class TrayApp:
             'enabled': self.active.is_set(),
             'status': self.status_text,
             'claims_this_session': self.claim_count,
-            'updated_at': time.time(),
             'window_height': self.root.winfo_height(),
             'required_height': self.root.winfo_reqheight()
         }
         try:
-            (DATA_DIR / 'status.json').write_text(json.dumps(self.status_data, ensure_ascii=False), encoding='utf8')
+            write_instance_status(self.status_data)
         except OSError:
             pass
         self.root.after(500, self.tick)
@@ -585,6 +870,8 @@ class TrayApp:
             return
         self.stopping = True
         self.active.clear()
+        self.idle_click_stop.set()
+        self.add_click_stop.set()
         self.exit_event.set()
         self.wake.set()
         def restore_chests_before_exit():
@@ -595,14 +882,16 @@ class TrayApp:
         threading.Thread(target=restore_chests_before_exit, name='tappo-ui-restore', daemon=True).start()
         self.set_status('Finishing current request before exit...')
         def finish():
-            if self.thread.is_alive() or not self.ui_exit_sync_done.is_set():
+            if (
+                self.thread.is_alive()
+                or (self.idle_click_thread and self.idle_click_thread.is_alive())
+                or (self.add_click_thread and self.add_click_thread.is_alive())
+                or not self.ui_exit_sync_done.is_set()
+            ):
                 self.root.after(200, finish)
                 return
             self.log.info('Tool stopped')
-            (DATA_DIR / 'status.json').write_text(
-                json.dumps({'enabled': False, 'status': 'Exited', 'updated_at': time.time()}, ensure_ascii=False),
-                encoding='utf8'
-            )
+            write_instance_status({'enabled': False, 'status': 'Exited'})
             try:
                 self.tray.stop()
             finally:
@@ -647,24 +936,68 @@ def main():
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel.CreateMutexW.restype = wintypes.HANDLE
-    handle = kernel.CreateMutexW(None, False, 'Local\\WuwaTappoAutoClaim-v1')
-    if not handle:
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel.ReleaseMutex.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    startup_lock = kernel.CreateMutexW(None, False, STARTUP_MUTEX_NAME)
+    if not startup_lock:
+        show_startup_error('Could not coordinate WuwaTappoAutoClaim startup. Please try again.')
         return 1
-    if ctypes.get_last_error() == 183:
-        SHOW_FILE.write_text('show', encoding='ascii')
-        return 0
-    STOP_FILE.unlink(missing_ok=True)
-    enabled = args.enable
-    if not enabled:
-        try:
-            enabled = bool(json.loads(CONFIG_FILE.read_text('utf8')).get('enabled', False))
-        except (OSError, ValueError):
-            pass
+    singleton = None
+    owns_startup_lock = False
     try:
-        TrayApp(enabled, args.start_minimized).run()
+        wait_result = kernel.WaitForSingleObject(startup_lock, 90_000)
+        if wait_result not in (0, 0x80):  # WAIT_OBJECT_0 / WAIT_ABANDONED
+            show_startup_error('Another WuwaTappoAutoClaim upgrade is still running. Please try again shortly.')
+            return 1
+        owns_startup_lock = True
+
+        ctypes.set_last_error(0)
+        singleton = kernel.CreateMutexW(None, False, 'Local\\WuwaTappoAutoClaim-v1')
+        if not singleton:
+            show_startup_error('Could not create the WuwaTappoAutoClaim single-instance lock.')
+            return 1
+        existing_instance = ctypes.get_last_error() == 183
+        if existing_instance:
+            previous_pids = _running_helper_pids()
+            previous_version = _running_instance_version(previous_pids)
+            if previous_version and version_key(previous_version) >= version_key(VERSION):
+                SHOW_FILE.write_text('show', encoding='ascii')
+                return 0
+            if not previous_pids:
+                show_startup_error(
+                    'An older WuwaTappoAutoClaim session is holding the single-instance lock, '
+                    'but Windows could not identify its process. Close it manually, then start this version again.'
+                )
+                return 1
+            if not _stop_previous_helpers():
+                show_startup_error(
+                    'The older WuwaTappoAutoClaim session did not close. Close it manually, then start this version again.'
+                )
+                return 1
+
+        STOP_FILE.unlink(missing_ok=True)
+        SHOW_FILE.unlink(missing_ok=True)
+        write_instance_status({'enabled': False, 'status': f'Starting v{VERSION}'})
+        if not kernel.ReleaseMutex(startup_lock):
+            show_startup_error('Could not release the WuwaTappoAutoClaim startup lock.')
+            return 1
+        owns_startup_lock = False
+
+        config = read_config()
+        enabled = args.enable or bool(config.get('enabled', False))
+        click_when_idle = bool(config.get('click_when_idle', False))
+        TrayApp(enabled, args.start_minimized, click_when_idle).run()
     finally:
-        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel.CloseHandle(handle)
+        if owns_startup_lock:
+            kernel.ReleaseMutex(startup_lock)
+        if singleton:
+            kernel.CloseHandle(singleton)
+        kernel.CloseHandle(startup_lock)
     return 0
 
 if __name__ == '__main__':
