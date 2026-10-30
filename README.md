@@ -2,9 +2,7 @@
 
 An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after the server says its cooldown has ended. It does not shorten or bypass the server cooldown.
 
-**Latest release:** [WuwaTappoAutoClaim-v1.1.0.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.0/WuwaTappoAutoClaim-v1.1.0.zip)
-
-**Current public release:** [GitHub Releases](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/latest)
+**Latest release:** [WuwaTappoAutoClaim-v1.1.1.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.1.1/WuwaTappoAutoClaim-v1.1.1.zip)
 
 **License:** [MIT](LICENSE)
 
@@ -28,13 +26,19 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Download `WuwaTappoAutoClaim-v1.1.0.zip` from the [v1.1.0 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.0).
+1. Download `WuwaTappoAutoClaim-v1.1.1.zip` from the [v1.1.1 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.1.1).
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe`, choose **Re-pair Session**, and approve the one-time Administrator prompt. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
 5. Choose **Enable Auto-Claim**. If UI sync is unavailable, the helper automatically waits for Tappo to save pending clicks, then restarts it once with the WebView2 setting needed for UI synchronization. Use **Re-sync Tappo UI** to try again; it first checks the live connection and only restarts Tappo if needed. Close or minimize the dashboard to keep the helper in the notification area.
 
 You can instead run `Run-Background.vbs` to start minimized with auto-claim enabled. Use **Exit** in the tray menu or `Stop-Tool.vbs` to stop it. It is not added to Windows Startup or Task Scheduler; launch it again after a Windows restart.
+
+## Version 1.1.1
+
+- Restrict chest and click synchronization to Tappo's main dashboard WebView; report chest hiding as successful only when matching controls were found and computed as hidden.
+- Update the main dashboard's Pinia store and confirm that Tappo's visible click counter reflects its calculated total, preserving locally pending clicks and spends.
+- Verify UI synchronization results to prevent false success when chest controls remain visible or the click counter does not refresh.
 
 ## Version 1.1.0
 

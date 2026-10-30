@@ -21,10 +21,14 @@ CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 CDP_ENV = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"
 _COMMAND_IDS = count(1)
 
-HIDE_CSS = (
+HIDE_SELECTOR = (
     ".reward-anchor, .reward-anchor--left, .reward-anchor--right, .reward-btn, "
     ".chest-reward-popup-layer, [class*=\"chest-reward-popup\"], "
-    "[class*=\"reward-anchor\"], [class*=\"reward-btn\"] { "
+    "[class*=\"reward-anchor\"], [class*=\"reward-btn\"]"
+)
+
+HIDE_CSS = HIDE_SELECTOR + (
+    " { "
     "display: none !important; visibility: hidden !important; "
     "pointer-events: none !important; opacity: 0 !important; "
     "width: 0 !important; height: 0 !important; }"
@@ -36,35 +40,46 @@ HIDE_SCRIPT = """
     if (!style) {
         style = document.createElement('style');
         style.id = 'wuwa-auto-claim-hide-chests';
-        style.textContent = __HIDE_CSS__;
         (document.head || document.documentElement).appendChild(style);
     }
-    document.querySelectorAll(
-        '.reward-anchor, .reward-anchor--left, .reward-anchor--right, .reward-btn, .chest-reward-popup-layer, [class*="chest-reward-popup"], [class*="reward-anchor"], [class*="reward-btn"]'
-    ).forEach(el => {
+    style.textContent = __HIDE_CSS__;
+    const elements = [...document.querySelectorAll(__HIDE_SELECTOR__)];
+    if (!elements.length) return false;
+    elements.forEach(el => {
         el.style.setProperty('display', 'none', 'important');
         el.style.setProperty('visibility', 'hidden', 'important');
         el.style.setProperty('pointer-events', 'none', 'important');
         el.style.setProperty('opacity', '0', 'important');
     });
-    return true;
+    return elements.every(el => {
+        const computed = window.getComputedStyle(el);
+        return computed.display === 'none'
+            && computed.visibility === 'hidden'
+            && computed.pointerEvents === 'none';
+    });
 })();
-""".replace("__HIDE_CSS__", json.dumps(HIDE_CSS))
+""".replace("__HIDE_CSS__", json.dumps(HIDE_CSS)).replace(
+    "__HIDE_SELECTOR__", json.dumps(HIDE_SELECTOR)
+)
 
 SHOW_SCRIPT = """
 (() => {
     const style = document.getElementById('wuwa-auto-claim-hide-chests');
     if (style) style.remove();
-    document.querySelectorAll(
-        '.reward-anchor, .reward-anchor--left, .reward-anchor--right, .reward-btn, .chest-reward-popup-layer, [class*="chest-reward-popup"], [class*="reward-anchor"], [class*="reward-btn"]'
-    ).forEach(el => {
+    const elements = [...document.querySelectorAll(__HIDE_SELECTOR__)];
+    elements.forEach(el => {
         for (const property of ['display', 'visibility', 'pointer-events', 'opacity']) {
             el.style.removeProperty(property);
         }
     });
-    return true;
-})();
-"""
+    return !document.getElementById('wuwa-auto-claim-hide-chests')
+        && elements.every(el =>
+            ['display', 'visibility', 'pointer-events', 'opacity'].every(
+                property => !el.style.getPropertyValue(property)
+            )
+        );
+})()
+""".replace("__HIDE_SELECTOR__", json.dumps(HIDE_SELECTOR))
 
 
 def _with_cdp_argument(value):
@@ -185,10 +200,9 @@ async def _apply_script(targets, script):
         })
         for target in targets
     ), return_exceptions=True)
-    return any(
-        _result_value(response) is True
+    return bool(responses) and all(
+        isinstance(response, dict) and _result_value(response) is True
         for response in responses
-        if isinstance(response, dict)
     )
 
 
@@ -197,7 +211,7 @@ def set_chests_hidden(hidden=True, timeout=5.0):
     script = HIDE_SCRIPT if hidden else SHOW_SCRIPT
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
-        targets = get_page_targets()
+        targets = _main_targets(get_page_targets())
         if targets:
             try:
                 if asyncio.run(_apply_script(targets, script)):
@@ -215,23 +229,70 @@ def set_tappo_click_state(gross, consumed, timeout=5.0):
         return False
 
     script = """
-    (() => {
-        const pinia = document.querySelector('#app')?.__vue_app__?.config?.globalProperties?.$pinia;
+    (async () => {
+        const app = document.querySelector('#app');
+        const pinia = app?.__vue_app__?.config?.globalProperties?.$pinia;
         const store = pinia?._s?.get('GlobalState');
-        if (!store || !store.userInfo || typeof store.userInfo !== 'object') return false;
-        store.userInfo = {
-            ...store.userInfo,
-            total_click_count: __GROSS__,
-            total_click_consume: __CONSUMED__
+        if (
+            !store
+            || !store.userInfo
+            || typeof store.userInfo !== 'object'
+            || typeof store.$patch !== 'function'
+        ) return false;
+
+        const pendingClicks = store.localClickCount;
+        const pendingSpend = store.serverClickSpend;
+        store.$patch({
+            userInfo: {
+                ...store.userInfo,
+                total_click_count: __GROSS__,
+                total_click_consume: __CONSUMED__
+            }
+        });
+        if (
+            store.userInfo.total_click_count !== __GROSS__
+            || store.userInfo.total_click_consume !== __CONSUMED__
+        ) return false;
+
+        // Let Vue flush the Pinia update before checking Tappo's visible counter.
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const expected = Number(store.totalClickCount);
+        if (!Number.isFinite(expected)) return false;
+        const expectedInteger = Math.trunc(expected);
+        const expectedDigits = String(expectedInteger);
+        const info = document.querySelector('#app .pet-info');
+        if (!info) return false;
+
+        const representsCount = text => {
+            const compact = String(text || '').trim().replace(/[\\s,，]/g, '');
+            const digits = compact.replace(/[^0-9]/g, '');
+            if (digits === expectedDigits) return true;
+            const match = compact.match(/^([0-9]+(?:\\.[0-9]+)?)([kKmM万亿])?$/);
+            if (!match) return false;
+            const scale = {
+                '': 1, k: 1e3, m: 1e6, '万': 1e4, '亿': 1e8
+            }[match[2] || ''];
+            return Math.round(Number(match[1]) * scale) === expectedInteger;
         };
-        return store.userInfo.total_click_count === __GROSS__
-            && store.userInfo.total_click_consume === __CONSUMED__;
+        const visibleCount = [...info.querySelectorAll('*')].some(el => {
+            if (el.children.length) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none'
+                && style.visibility !== 'hidden'
+                && rect.width > 0
+                && rect.height > 0
+                && representsCount(el.textContent);
+        });
+        return visibleCount
+            && store.localClickCount === pendingClicks
+            && store.serverClickSpend === pendingSpend;
     })();
     """.replace('__GROSS__', json.dumps(gross)).replace('__CONSUMED__', json.dumps(consumed))
 
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
-        targets = get_page_targets()
+        targets = _main_targets(get_page_targets())
         if targets:
             try:
                 if asyncio.run(_apply_script(targets, script)):

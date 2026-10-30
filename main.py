@@ -23,7 +23,7 @@ from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_exis
 from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
 from ui_sync import set_chests_hidden, set_tappo_click_state, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -404,7 +404,11 @@ class TrayApp:
                     if data['success'] and data['claim_generation'] == self.tappo_claim_generation:
                         self.tappo_click_sync_pending = False
                     elif not data['success']:
-                        self.log.warning('Could not update Tappo click display without reloading.')
+                        self.log.warning(
+                            'Could not confirm the Tappo click display update; it will be retried.'
+                        )
+                        if self.tappo_click_sync_pending and self.active.is_set():
+                            self.set_status('Tappo click display update is pending; retrying...')
             elif event == 'need_clicks' and self.active.is_set():
                 self.set_status('Not enough clicks (need >= 1,000). Keep clicking in the app.')
             elif event == 'ui_sync_unavailable':
