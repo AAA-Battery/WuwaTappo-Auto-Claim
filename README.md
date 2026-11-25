@@ -2,7 +2,7 @@
 
 An unofficial Windows system-tray helper that claims a Wuwa Tappo chest after the server says its cooldown has ended. It does not shorten or bypass the server cooldown.
 
-**Latest release:** [WuwaTappoAutoClaim-v1.2.2.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.2.2/WuwaTappoAutoClaim-v1.2.2.zip)
+**Latest release:** [WuwaTappoAutoClaim-v1.3.0.zip](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/download/v1.3.0/WuwaTappoAutoClaim-v1.3.0.zip)
 
 **License:** [MIT](LICENSE)
 
@@ -29,7 +29,7 @@ The service remains authoritative. It may reject a claim during cooldown, after 
 
 ## Install and run the prebuilt app
 
-1. Download `WuwaTappoAutoClaim-v1.2.2.zip` from the [v1.2.2 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.2.2).
+1. Download `WuwaTappoAutoClaim-v1.3.0.zip` from the [v1.3.0 GitHub Release](https://github.com/AAA-Battery/WuwaTappo-Auto-Claim/releases/tag/v1.3.0).
 2. Extract the whole ZIP to a folder. Keep `_internal` beside `WuwaTappoAutoClaim.exe`.
 3. Open Wuwa Tappo and log in.
 4. Run `WuwaTappoAutoClaim.exe` and approve the Administrator prompt each time it starts. Choose **Re-pair Session** if needed. Pairing restarts Wuwa Tappo once to read its own WebView2 session cookie; log in again if needed.
