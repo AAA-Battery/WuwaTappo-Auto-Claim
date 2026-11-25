@@ -31,3 +31,6 @@ venv/
 # IDE configurations
 .vscode/
 .idea/
+
+# Release output
+release-assets/

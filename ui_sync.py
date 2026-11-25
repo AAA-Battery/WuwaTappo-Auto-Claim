@@ -440,6 +440,38 @@ def deduct_tappo_clicks(amount=1000, timeout=5.0):
             return False
         time.sleep(0.35)
 
+def read_tappo_click_count():
+    """Read Tappo's live cumulative click count (read-only).
+
+    This is the number Tappo itself sends when it opens a chest: the last reported
+    server total plus clicks it has counted but not reported yet. Returns None when
+    Tappo's page or store is not available.
+    """
+    script = """
+    (() => {
+        try {
+            const app = document.querySelector('#app');
+            const pinia = app?.__vue_app__?.config?.globalProperties?.$pinia;
+            const store = pinia?._s?.get('GlobalState');
+            if (!store || !store.userInfo) return null;
+            const value = Number(store.cumulativeClickCount);
+            return Number.isSafeInteger(value) && value >= 0 ? value : null;
+        } catch (e) {
+            return null;
+        }
+    })();
+    """
+    targets = _main_targets(get_page_targets())
+    if not targets:
+        return None
+    try:
+        values = asyncio.run(_evaluate_script_values(targets, script))
+    except RuntimeError:
+        return None
+    values = [v for v in values if type(v) is int or (type(v) is float and v.is_integer())]
+    return int(max(values)) if values else None
+
+
 def set_tappo_click_state(gross, consumed, timeout=5.0):
     """Patch server-confirmed click totals into the live Vue/Pinia store."""
     if (

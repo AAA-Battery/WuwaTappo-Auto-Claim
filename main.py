@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox
 from datetime import datetime
 import pystray
@@ -22,11 +23,12 @@ from PIL import Image
 from chest_autoclaim_ui import ChestAutoClaimUI
 
 from windows_auth import DATA_DIR, AUTH_FILE, AuthError, load_session, pair_existing_session, find_app_exe
-from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES
-from ui_sync import set_chests_hidden, set_tappo_click_state, deduct_tappo_clicks, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync, launch_tappo_process
+import updater
+from core import ApiClient, ApiError, TransportError, Engine, AUTH_CODES, CHEST_COOLDOWN_SECONDS
+from ui_sync import read_tappo_click_count, set_chests_hidden, set_tappo_click_state, deduct_tappo_clicks, sync_after_claim, ensure_webview2_cdp_env, restart_tappo_for_ui_sync, launch_tappo_process
 from idle_activity import MANUAL_CLICK_INTERVAL_SECONDS, run_idle_activity, add_f15_clicks
 
-VERSION = '1.2.2'
+VERSION = '1.3.0'
 STOP_FILE = DATA_DIR / 'stop.flag'
 SHOW_FILE = DATA_DIR / 'show.flag'
 CONFIG_FILE = DATA_DIR / 'config.json'
@@ -70,6 +72,35 @@ def read_instance_status():
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+UPDATE_DIR = DATA_DIR / 'update'
+
+def install_dir():
+    """Folder the running app is installed in (the source folder when not packaged)."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+def format_progress(done, total):
+    done_mb = done / (1024 * 1024)
+    if total:
+        return f'Downloading {done_mb:.0f} / {total / (1024 * 1024):.0f} MB'
+    return f'Downloading {done_mb:.0f} MB'
+
+def update_message_to_ui(event, data, current):
+    """Map an update event to the (state, text) the Settings row should show, or None."""
+    if event == 'update_checked':
+        if data.get('error'):
+            return None if data.get('silent') else ('error', data['error'])
+        info = data.get('info')
+        if info:
+            return ('available', f'v{info.version} is available')
+        return ('uptodate', f"You're up to date (v{current})")
+    if event == 'update_progress':
+        return ('downloading', data.get('text', ''))
+    if event == 'update_failed':
+        return ('error', data.get('error') or 'The update failed.')
+    return None
 
 def version_key(value):
     try:
@@ -319,10 +350,14 @@ class TrayApp:
         self.tappo_click_sync_lock = threading.Lock()
         self.ui_exit_sync_done = threading.Event()
         self.stopping = False
+        self.update_info = None
+        self.update_busy = False
+        self.update_silent = True
         self.click_when_idle = bool(click_when_idle)
         self.idle_click_stop = threading.Event()
         self.idle_click_thread = None
         self.add_clicks_running = False
+        self.add_clicks_stopping = False
         self.add_click_stop = threading.Event()
         self.add_click_thread = None
         self.root = tk.Tk()
@@ -340,6 +375,9 @@ class TrayApp:
             on_exit=self.quit,
             on_toggle_idle_click=self.toggle_click_when_idle,
             on_add_clicks=self.add_1000_clicks,
+            on_stop_add_clicks=self.stop_add_1000_clicks,
+            on_check_update=self.check_for_updates,
+            on_install_update=self.install_update,
         )
         self.ui.set_auto_claim_state(False)
         self.ui.set_click_when_idle(self.click_when_idle)
@@ -372,6 +410,10 @@ class TrayApp:
         if minimized:
             self.root.withdraw()
         self.root.after(300, self.tick)
+        if getattr(sys, 'frozen', False):
+            threading.Thread(target=updater.cleanup_after_update, args=(install_dir(), UPDATE_DIR),
+                             name='update-cleanup', daemon=True).start()
+        self.root.after(8000, lambda: self.check_for_updates(silent=True))
         (DATA_DIR / 'startup-error.txt').unlink(missing_ok=True)
         self.log.info('Tool started v%s', VERSION)
 
@@ -467,7 +509,8 @@ class TrayApp:
         if self.stopping or self.add_clicks_running:
             return
         self.add_clicks_running = True
-        self.ui.set_add_clicks_running(True)
+        self.add_clicks_stopping = False
+        self.ui.set_add_clicks_running(True, False)
         self.add_click_stop.clear()
         self.idle_click_stop.set()
         self.log.info(
@@ -481,9 +524,18 @@ class TrayApp:
         )
         self.add_click_thread.start()
 
+    def stop_add_1000_clicks(self):
+        if not self.add_clicks_running or self.add_clicks_stopping:
+            return
+        self.add_clicks_stopping = True
+        self.add_click_stop.set()
+        self.ui.set_add_clicks_running(True, True)
+        self.log.info('Manual F15 batch emergency stop requested by user.')
+
     def _run_manual_click_batch(self):
         completed = 0
         error = None
+        requested = 1000000
         try:
             if self.idle_click_thread and self.idle_click_thread.is_alive():
                 self.idle_click_thread.join(timeout=1.0)
@@ -491,15 +543,20 @@ class TrayApp:
                 raise RuntimeError('The idle click worker did not stop before the manual batch.')
             completed = add_f15_clicks(
                 self.add_click_stop,
-                count=1000,
-                interval=MANUAL_CLICK_INTERVAL_SECONDS,
+                count=requested,
+                interval=0.15 #MANUAL_CLICK_INTERVAL_SECONDS,
             )
         except Exception as exc:
             error = str(exc) or type(exc).__name__
             self.log.exception('Manual F15 batch stopped after %s presses.', completed)
         self.messages.put((
             'add_clicks_finished',
-            {'completed': completed, 'error': error},
+            {
+                'completed': completed,
+                'error': error,
+                'requested': requested,
+                'stopped': self.add_click_stop.is_set() and error is None,
+            },
         ))
 
     def sync_chests(self, hidden=True, after_claim=False):
@@ -652,7 +709,8 @@ class TrayApp:
                         self.client = ApiClient(load_session()['token'])
                         self.engine = Engine(
                             self.client, DATA_DIR / 'claim-journal.json', self.emit, current_cuid,
-                            should_claim=lambda: self.active.is_set() and not self.exit_event.is_set()
+                            should_claim=lambda: self.active.is_set() and not self.exit_event.is_set(),
+                            click_source=read_tappo_click_count
                         )
                     delay = self.engine.step()
                     backoff = 30
@@ -774,16 +832,23 @@ class TrayApp:
                 self.ui.set_click_when_idle(False)
             elif event == 'add_clicks_finished':
                 self.add_clicks_running = False
-                self.ui.set_add_clicks_running(False)
-                if data.get('error'):
+                self.add_clicks_stopping = False
+                self.ui.set_add_clicks_running(False, False)
+                requested = data.get('requested', 1000000)
+                if data.get('stopped'):
+                    self.log.info(
+                        'Manual F15 batch stopped by user after %s/%s presses.',
+                        data.get('completed', 0), requested,
+                    )
+                elif data.get('error'):
                     self.log.error(
-                        'Manual F15 batch stopped at %s/1000 presses: %s',
-                        data.get('completed', 0), data['error'],
+                        'Manual F15 batch stopped at %s/%s presses: %s',
+                        data.get('completed', 0), requested, data['error'],
                     )
                 else:
                     self.log.info(
-                        'Manual F15 batch completed (%s/1000 presses).',
-                        data.get('completed', 0),
+                        'Manual F15 batch completed (%s/%s presses).',
+                        data.get('completed', 0), requested,
                     )
                 if self.click_when_idle and not self.stopping:
                     self._start_idle_clicker()
@@ -814,6 +879,15 @@ class TrayApp:
                 self.ui_sync_warned = True
                 self.set_status(data.get('detail', 'Could not synchronize Tappo. Click Re-sync Tappo UI to try again.'))
             elif event == 'claimed':
+                if self.countdowns and data.get('slot') in ('left', 'right'):
+                    # Start the 30-minute cooldown now; /user/me can lag a minute behind.
+                    elapsed = time.monotonic() - self.countdowns[0]
+                    left, right = (max(0, v - elapsed) for v in self.countdowns[1:])
+                    if data['slot'] == 'left':
+                        left = CHEST_COOLDOWN_SECONDS
+                    else:
+                        right = CHEST_COOLDOWN_SECONDS
+                    self.countdowns = (time.monotonic(), left, right)
                 self.claim_count += 1
                 self.tappo_claim_generation += 1
                 self.tappo_click_sync_pending = True
@@ -838,6 +912,10 @@ class TrayApp:
             elif event == 'auth_needed':
                 self.set_enabled(False)
                 self.set_status('Session expired or account changed. Please re-pair.')
+            elif event in ('update_checked', 'update_progress', 'update_failed', 'update_staged'):
+                self.handle_update_event(event, data)
+            elif event == 'claim_retry':
+                self.set_status(f"Server returned code {data['code']}; re-reading click count and retrying now.")
             elif event == 'claim_rejected':
                 self.set_status(f"Server returned code {data['code']}; waiting before retry.")
             elif event == 'claim_uncertain':
@@ -864,6 +942,101 @@ class TrayApp:
         except OSError:
             pass
         self.root.after(500, self.tick)
+
+    def check_for_updates(self, silent=False):
+        if self.stopping:
+            return
+        if self.update_busy:
+            if not silent:
+                # A manual press adopts the running check, so its result (even an error) is shown.
+                self.update_silent = False
+                self.ui.set_update_state('checking', 'Working on it...')
+            return
+        self.update_busy = True
+        self.update_silent = silent
+        if not silent:
+            self.ui.set_update_state('checking', 'Checking GitHub...')
+
+        def run():
+            info = error = None
+            try:
+                info = updater.check_for_update(VERSION)
+            except updater.UpdateError as exc:
+                error = str(exc)
+            except Exception:
+                self.log.exception('Update check failed unexpectedly.')
+                error = 'The update check failed unexpectedly.'
+            self.messages.put(('update_checked', {'info': info, 'error': error, 'silent': self.update_silent}))
+
+        threading.Thread(target=run, name='update-check', daemon=True).start()
+
+    def install_update(self):
+        info = self.update_info
+        if not info or self.update_busy or self.stopping:
+            return
+        if not getattr(sys, 'frozen', False):
+            webbrowser.open(info.page_url)
+            self.ui.set_update_state('available', 'Opened the release page; updates are applied only by the packaged app.')
+            return
+        try:
+            updater.preflight_install_dir(install_dir())
+        except updater.UpdateError as exc:
+            self.ui.set_update_state('error', str(exc))
+            return
+        self.update_busy = True
+        self.ui.set_update_state('downloading', 'Starting download...')
+        last_report = [0.0]
+
+        def progress(done, total):
+            now = time.monotonic()
+            if now - last_report[0] >= 0.3:
+                last_report[0] = now
+                self.messages.put(('update_progress', {'text': format_progress(done, total)}))
+
+        def run():
+            try:
+                staged = updater.stage_update(info, UPDATE_DIR, progress=progress)
+            except updater.UpdateError as exc:
+                self.messages.put(('update_failed', {'error': str(exc)}))
+                return
+            except Exception:
+                self.log.exception('Update failed unexpectedly.')
+                self.messages.put(('update_failed', {'error': 'The update failed unexpectedly.'}))
+                return
+            self.messages.put(('update_staged', {'staged': staged}))
+
+        threading.Thread(target=run, name='update-download', daemon=True).start()
+
+    def handle_update_event(self, event, data):
+        if event == 'update_checked':
+            self.update_busy = False
+            self.update_info = data.get('info')
+            if data.get('error'):
+                self.log.warning('Update check failed: %s', data['error'])
+            elif self.update_info:
+                self.log.info('Update available: v%s', self.update_info.version)
+        elif event == 'update_failed':
+            self.update_busy = False
+            self.log.warning('Update failed: %s', data.get('error'))
+        elif event == 'update_staged':
+            self.apply_staged_update(data['staged'])
+            return
+        message = update_message_to_ui(event, data, VERSION)
+        if message:
+            self.ui.set_update_state(*message)
+
+    def apply_staged_update(self, staged):
+        relaunch_args = ['--enable'] if self.active.is_set() else []
+        try:
+            updater.launch_apply(staged, install_dir(), os.getpid(), UPDATE_DIR, relaunch_args)
+        except updater.UpdateError as exc:
+            self.update_busy = False
+            self.log.warning('Could not start the update helper: %s', exc)
+            self.ui.set_update_state('error', str(exc))
+            return
+        self.log.info('Update to v%s staged; restarting', self.update_info.version if self.update_info else '?')
+        self.ui.set_update_state('downloading', 'Restarting to finish the update...')
+        self.quit()
 
     def quit(self):
         if self.stopping:

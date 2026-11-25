@@ -39,6 +39,18 @@ You can instead run `Run-Background.vbs` to start minimized with auto-claim enab
 
 When a newer helper version starts, it asks older running helper processes to close and waits for them before opening its dashboard. If an older process is unresponsive, the new version closes that identified helper process before continuing. If the same or a newer version is already running, the new launch brings its existing window forward instead of starting a duplicate.
 
+## Updating
+
+From version 1.3.0, open **Settings** (the gear at the bottom left) and choose **Check for updates**. If a newer GitHub Release exists, choose **Update now**. The app downloads the release ZIP, verifies its SHA-256 against the `.sha256` file attached to the same release, replaces its own files, and restarts. Your session, claim history and settings are kept (they live in `%LOCALAPPDATA%\WuwaTappoAutoClaim`). A release without a `.sha256` file is never installed. If anything fails, the previous version is restored. The app also checks quietly a few seconds after it starts and only shows **⚙ Update available**; it never installs without your click. When running from source, the button only opens the release page.
+
+Versions before 1.3.0 have no updater, so install 1.3.0 manually once as described above.
+
+## Version 1.3.0
+
+- Add **Check for updates / Update now** in Settings (verified download, automatic restart, rollback on failure).
+- Fix auto-claim being rejected with server code 70003: the claim now sends the same click total as Tappo itself, and retries immediately with fresh totals.
+- Fix chest timers showing **Ready** for about a minute after a claim: the 30-minute cooldown starts at claim time until the server reports the new deadline.
+
 ## Version 1.2.2
 
 - Show the 15-second idle click explanation as a tooltip when hovering over **Click when idle**; restore the general footer notice.
@@ -160,6 +172,12 @@ The prebuilt executable is not code-signed. Review the source and release checks
    ```
 
 5. To build the portable folder, run `build.bat`. The script accepts both the GitHub source archive layout (Python files at the root) and the nested `source/` layout. It installs dependencies into the same Python environment used by PyInstaller, verifies the tray dependencies, and embeds `Zani.ico` plus `Zani.png`. The output is placed in `dist/WuwaTappoAutoClaim/`. Copy `README.md`, `LICENSE`, `Run-Background.vbs`, and `Stop-Tool.vbs` beside the executable before making a ZIP for distribution.
+
+### Publishing a release
+
+1. Raise `VERSION` in `main.py` and run `build.bat`.
+2. Run `python tools/make_release.py <version>` (for example `1.3.0`). It writes `WuwaTappoAutoClaim-v<version>.zip` and `WuwaTappoAutoClaim-v<version>.zip.sha256` to `release-assets/`.
+3. Create a GitHub Release tagged `v<version>` and upload **both** files. In-app updates need exactly these two asset names.
 
 The included character artwork is supplied as the app icon and is separate from the MIT-licensed project code; image rights remain with its respective owner. The source includes a unit test module at `source/test_core.py` (or `test_core.py` in the root layout); dependencies are listed in `source/requirements.txt` (or `requirements.txt` in the root layout).
 

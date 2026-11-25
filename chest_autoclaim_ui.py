@@ -182,8 +182,12 @@ def enable_dark_titlebar(window):
 # Settings dialog
 # ---------------------------------------------------------------------------
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master, on_open_log, on_resync, on_add_clicks):
+    def __init__(self, master, on_open_log, on_resync, on_add_clicks,
+                 on_stop_add_clicks, on_check_update=None, on_install_update=None):
         super().__init__(master)
+        self._on_check_update = on_check_update
+        self._on_install_update = on_install_update
+        self._update_state = "idle"
         self.title("Settings")
         self.configure(bg=BG)
         self.resizable(False, False)
@@ -204,10 +208,14 @@ class SettingsDialog(tk.Toplevel):
             "Reload timers and state from Wuwa Tappo.", "Re-sync", on_resync
         )
         self._add_clicks_button = self._row(
-            body, "Add 1000 clicks",
-            "Send 1,000 F15 presses with 0.15-second spacing.",
-            "Add", on_add_clicks,
+            body, "Add 1000 clicks", "", "Add", on_add_clicks,
+            secondary_action="Stop", secondary_command=on_stop_add_clicks,
         )
+        self._update_button, self._update_desc = self._row(
+            body, "Check for updates", "Check whether a newer version is available.",
+            "Check", self._on_update_clicked, return_desc=True,
+        )
+        self._update_desc.configure(wraplength=290, justify="left")
 
         tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=(16, 12))
         footer = tk.Frame(body, bg=BG)
@@ -227,31 +235,69 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
         self.focus_set()
 
-    def _row(self, master, title, desc, action, command):
+    def _row(self, master, title, desc, action, command,
+             secondary_action=None, secondary_command=None, return_desc=False):
         row = card(master, padx=14, pady=12)
         row.pack(fill="x", pady=(0, 8))
         text = tk.Frame(row, bg=CARD)
         text.pack(side="left", fill="x", expand=True)
         tk.Label(text, text=title, bg=CARD, fg=TEXT,
                  font=(FONT_SEMI, 10)).pack(anchor="w")
-        tk.Label(text, text=desc, bg=CARD, fg=MUTED,
-                 font=(FONT, 9)).pack(anchor="w")
+        desc_label = None
+        if desc:
+            desc_label = tk.Label(text, text=desc, bg=CARD, fg=MUTED,
+                                  font=(FONT, 9))
+            desc_label.pack(anchor="w")
 
         def run():
             if command:
                 command()
 
-        button = HoverButton(row, action, run, "secondary", padx=14, pady=6,
+        actions = tk.Frame(row, bg=CARD)
+        actions.pack(side="right", padx=(12, 0))
+        button = HoverButton(actions, action, run, "secondary", padx=14, pady=6,
                              font=(FONT_SEMI, 9))
-        button.pack(side="right", padx=(12, 0))
-        return button
+        button.pack(side="left")
+        if secondary_action:
+            def run_secondary():
+                if secondary_command:
+                    secondary_command()
+
+            self._stop_add_clicks_button = HoverButton(
+                actions, secondary_action, run_secondary, "danger",
+                padx=14, pady=6, font=(FONT_SEMI, 9),
+            )
+            self._stop_add_clicks_button.pack(side="left", padx=(8, 0))
+            self._stop_add_clicks_button.set_enabled(False)
+        return (button, desc_label) if return_desc else button
+
+    def _on_update_clicked(self):
+        callback = self._on_install_update if self._update_state == "available" else self._on_check_update
+        if callback:
+            callback()
+
+    def set_update_state(self, state, text):
+        """state: 'idle' | 'checking' | 'uptodate' | 'available' | 'downloading' | 'error'"""
+        self._update_state = state
+        label, enabled = {
+            "checking": ("Checking...", False),
+            "available": ("Update now", True),
+            "downloading": ("Updating...", False),
+        }.get(state, ("Check", True))
+        self._update_button.configure(text=label)
+        self._update_button.set_enabled(enabled)
+        self._update_desc.configure(text=text)
 
     def set_resyncing(self, resyncing):
         self._resync_button.set_enabled(not resyncing)
 
-    def set_add_clicks_running(self, running):
+    def set_add_clicks_running(self, running, stopping=False):
         self._add_clicks_button.configure(text="Adding..." if running else "Add")
         self._add_clicks_button.set_enabled(not running)
+        self._stop_add_clicks_button.configure(
+            text="Stopping..." if stopping else "Stop"
+        )
+        self._stop_add_clicks_button.set_enabled(running and not stopping)
 
     def close(self):
         self.grab_release()
@@ -264,8 +310,13 @@ class SettingsDialog(tk.Toplevel):
 class ChestAutoClaimUI:
     def __init__(self, root, on_toggle_pause=None, on_repair=None,
                  on_minimize=None, on_open_log=None, on_resync=None, on_exit=None,
-                 on_toggle_idle_click=None, on_add_clicks=None):
+                 on_toggle_idle_click=None, on_add_clicks=None,
+                 on_stop_add_clicks=None, on_check_update=None, on_install_update=None):
         self.root = root
+        self.on_check_update = on_check_update
+        self.on_install_update = on_install_update
+        self.update_state = "idle"
+        self.update_text = "Check whether a newer version is available."
         self.on_toggle_pause = on_toggle_pause
         self.on_repair = on_repair
         self.on_minimize = on_minimize
@@ -274,11 +325,13 @@ class ChestAutoClaimUI:
         self.on_exit = on_exit
         self.on_toggle_idle_click = on_toggle_idle_click
         self.on_add_clicks = on_add_clicks
+        self.on_stop_add_clicks = on_stop_add_clicks
         self.enabled = False
         self.paused = False
         self.pairing = False
         self.resyncing = False
         self.add_clicks_running = False
+        self.add_clicks_stopping = False
         self._settings = None
 
         root.title("Wuwa Tappo \u2022 Chest Auto-Claim")
@@ -412,6 +465,7 @@ class ChestAutoClaimUI:
         gear = HoverButton(footer, "\u2699", self.open_settings, "ghost",
                            font=(FONT_ICON, 15), padx=10, pady=2)
         gear.pack(side="left")
+        self._gear = gear
         Tooltip(gear, "Settings")
         HoverButton(footer, "Exit", self._exit, "danger", padx=28).pack(side="right")
 
@@ -448,15 +502,28 @@ class ChestAutoClaimUI:
             on_open_log=self._call(lambda: self.on_open_log),
             on_resync=self._call(lambda: self.on_resync),
             on_add_clicks=self._call(lambda: self.on_add_clicks),
+            on_stop_add_clicks=self._call(lambda: self.on_stop_add_clicks),
+            on_check_update=self._call(lambda: self.on_check_update),
+            on_install_update=self._call(lambda: self.on_install_update),
         )
+        self._settings.set_update_state(self.update_state, self.update_text)
         self._settings.set_resyncing(self.resyncing)
-        self._settings.set_add_clicks_running(self.add_clicks_running)
+        self._settings.set_add_clicks_running(
+            self.add_clicks_running, self.add_clicks_stopping
+        )
 
     # ---- public API -------------------------------------------------------
     def set_status(self, text, state="waiting"):
         """state: 'waiting' | 'active' | 'paused' | 'error'"""
         self._status.configure(text=text)
         self._dot.itemconfigure(self._dot_id, fill=STATUS_COLORS.get(state, MUTED))
+
+    def set_update_state(self, state, text):
+        """state: 'idle' | 'checking' | 'uptodate' | 'available' | 'downloading' | 'error'"""
+        self.update_state, self.update_text = state, text
+        self._gear.configure(text="⚙ Update available" if state == "available" else "⚙")
+        if self._settings and self._settings.winfo_exists():
+            self._settings.set_update_state(state, text)
 
     def set_timers(self, left, right):
         self._left.configure(text=left)
@@ -518,8 +585,9 @@ class ChestAutoClaimUI:
         if self._settings and self._settings.winfo_exists():
             self._settings.set_resyncing(self.resyncing)
 
-    def set_add_clicks_running(self, running):
+    def set_add_clicks_running(self, running, stopping=False):
         self.add_clicks_running = bool(running)
+        self.add_clicks_stopping = bool(stopping)
         if self._settings and self._settings.winfo_exists():
-            self._settings.set_add_clicks_running(running)
+            self._settings.set_add_clicks_running(running, stopping)
 

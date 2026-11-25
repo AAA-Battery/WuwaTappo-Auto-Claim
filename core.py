@@ -12,6 +12,15 @@ import requests
 API_HOST = 'https://api-wutheringwaves-wuwatappo.kurogames-global.com/'
 AUTH_CODES = {10002, 10003, 90002}
 SAFE_COUNT = 9007199254740991
+# 70003 = "Invalid client point count": the click_num sent with the claim was not
+# accepted. Tappo itself sends serverTotal + not-yet-reported local clicks.
+INVALID_CLICKS_CODE = 70003
+# Chest cooldown after a successful open (Tappo itself starts a local 30-minute timer).
+CHEST_COOLDOWN_SECONDS = 30 * 60
+# Clicks Tappo may hold locally between two click reports (it flushes every few seconds).
+MAX_UNREPORTED_CLICKS = 50_000
+# Immediate in-place retries for 70003 (seconds); each retry re-reads the account first.
+INVALID_CLICKS_RETRY_DELAYS = (1.5, 4.0)
 
 class ApiError(Exception):
     def __init__(self, code, message=''):
@@ -72,7 +81,8 @@ class ApiClient:
                 raise TransportError('API response in invalid format.')
             code = int(obj['code'])
             if code not in (0, 200):
-                raise ApiError(code)
+                note = obj.get('msg') or obj.get('message') or ''
+                raise ApiError(code, f'API {code}: {str(note)[:120]}' if note else '')
             if not isinstance(obj.get('data'), dict):
                 raise TransportError('API response missing chest data.')
             return obj['data']
@@ -140,12 +150,15 @@ def parse_state(info):
     )
 
 class Engine:
-    def __init__(self, api, journal_path, emit=lambda event, **kw: None, expected_cuid=lambda: None, should_claim=lambda: True):
+    def __init__(self, api, journal_path, emit=lambda event, **kw: None, expected_cuid=lambda: None,
+                 should_claim=lambda: True, click_source=lambda: None, sleep=time.sleep):
         self.api = api
         self.path = Path(journal_path)
         self.emit = emit
         self.expected_cuid = expected_cuid
         self.should_claim = should_claim
+        self.click_source = click_source
+        self.sleep = sleep
         self.attempts = {}
         self.last_state = None
         self.account = ''
@@ -173,9 +186,39 @@ class Engine:
         self.last_state = state
         return state
 
+    def apply_claim_estimates(self, state, now):
+        """Replace chest deadlines that /user/me has not caught up with after a claim.
+
+        /user/me keeps returning the pre-claim snapshot for roughly 30-90 seconds after
+        a successful open. Until the deadline changes, use the cooldown that started
+        when we claimed, so the countdown runs instead of showing the chest as ready.
+        """
+        for slot, deadline in state.deadlines.items():
+            last = self.attempts.get(slot, {})
+            estimate = last.get('next')
+            if (last.get('outcome') == 'success' and last.get('cycle') == deadline
+                    and type(estimate) in (int, float) and estimate > now):
+                state.deadlines[slot] = float(estimate)
+
+    def click_num(self, state):
+        """Click total to send with a claim.
+
+        The real client sends its live cumulative count (last reported total plus clicks
+        not reported yet). The server's own count can run ahead of /user/me while clicks
+        are being reported, so prefer the live count when it is plausible.
+        """
+        try:
+            live = self.click_source()
+        except Exception:
+            return state.gross
+        if type(live) is int and state.gross <= live <= min(SAFE_COUNT, state.gross + MAX_UNREPORTED_CLICKS):
+            return live
+        return state.gross
+
     def step(self, allow_claim=True):
         state = self.inspect()
         now = self.api.clock.now()
+        self.apply_claim_estimates(state, now)
         self.emit('status', balance=state.balance, gross=state.gross, consumed=state.consumed,
                   left=max(0, state.deadlines['left'] - now),
                   right=max(0, state.deadlines['right'] - now))
@@ -197,20 +240,43 @@ class Engine:
                 continue
             self.attempts[slot] = {'cycle': deadline, 'outcome': 'pending', 'retry_after': now + 30}
             self.save()
-            try:
-                reward = self.api.open(slot, state.gross)
-            except ApiError as exc:
-                self.attempts[slot]['outcome'] = 'rejected'
-                self.save()
-                self.emit('claim_rejected', slot=slot, code=exc.code)
-                if exc.code in AUTH_CODES:
+            retry_delays = iter(INVALID_CLICKS_RETRY_DELAYS)
+            while True:
+                click_num = self.click_num(state)
+                sent_at = self.api.clock.now()
+                try:
+                    reward = self.api.open(slot, click_num)
+                    break
+                except ApiError as exc:
+                    detail = dict(slot=slot, code=exc.code, sent=click_num, server_gross=state.gross,
+                                  note=str(exc)[:160])
+                    delay = next(retry_delays, None) if exc.code == INVALID_CLICKS_CODE else None
+                    if delay is not None and self.should_claim():
+                        self.emit('claim_retry', **detail)
+                        self.sleep(delay)
+                        try:
+                            state = self.inspect()
+                        except (ApiError, TransportError):
+                            self.attempts[slot]['outcome'] = 'rejected'
+                            self.save()
+                            raise
+                        if state.deadlines[slot] != deadline or state.balance < 1000:
+                            self.attempts[slot]['outcome'] = 'rejected'
+                            self.save()
+                            return 2
+                        continue
+                    self.attempts[slot]['outcome'] = 'rejected'
+                    self.save()
+                    self.emit('claim_rejected', **detail)
+                    if exc.code in AUTH_CODES:
+                        raise
+                    return 30 if exc.code in (70003, 70004, 70005, 70006) else 120
+                except TransportError:
+                    self.emit('claim_uncertain', slot=slot)
+                    # Keep pending on disk. Next attempt must re-read account state.
                     raise
-                return 30 if exc.code in (70003, 70004, 70005, 70006) else 120
-            except TransportError:
-                self.emit('claim_uncertain', slot=slot)
-                # Keep pending on disk. Next attempt must re-read account state.
-                raise
             self.attempts[slot]['outcome'] = 'success'
+            self.attempts[slot]['next'] = sent_at + CHEST_COOLDOWN_SECONDS
             self.save()
             self.emit('claimed', slot=slot, asset_id=reward.get('asset_id'),
                       asset_name=str(reward.get('asset_name', ''))[:150],

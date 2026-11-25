@@ -14,7 +14,11 @@ class LASTINPUTINFO(ctypes.Structure):
     ]
 
 
+VK_F13 = 0x7C
+VK_F14 = 0x7D
 VK_F15 = 0x7E
+VK_F16 = 0x7F
+BURST_KEYS = [VK_F13, VK_F14, VK_F15, VK_F16]  # 4 harmless high function keys (no text/shortcut side-effects)
 KEYEVENTF_KEYUP = 0x0002
 IDLE_THRESHOLD_SECONDS = 15.0
 IDLE_BATCH_CLICKS = 1000
@@ -40,6 +44,22 @@ def _press_f15(user32, stop_event):
     finally:
         user32.keybd_event(VK_F15, 0, KEYEVENTF_KEYUP, 0)
     stop_event.wait(0.02)
+    return not stop_event.is_set()
+
+
+def _press_cluster(user32, stop_event, keys=BURST_KEYS):
+    if stop_event.is_set():
+        return False
+    pressed = []
+    try:
+        for vk in keys:
+            user32.keybd_event(vk, 0, 0, 0)
+            pressed.append(vk)
+        stop_event.wait(0.01)
+    finally:
+        for vk in reversed(pressed):
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+    stop_event.wait(0.01)
     return not stop_event.is_set()
 
 
@@ -99,7 +119,7 @@ def run_idle_activity(stop_event):
 
 def add_f15_clicks(stop_event, count=MANUAL_BATCH_CLICKS,
                    interval=MANUAL_CLICK_INTERVAL_SECONDS):
-    """Send a fixed F15 batch with a 0.15-second start-to-start interval."""
+    """Send a fixed burst batch of 4 high function keys (F13-F16)."""
     if type(count) is not int or count <= 0 or interval < 0:
         raise ValueError("count must be positive and interval cannot be negative")
 
@@ -118,8 +138,11 @@ def add_f15_clicks(stop_event, count=MANUAL_BATCH_CLICKS,
         wait_time = next_press_time - time.monotonic()
         if wait_time > 0 and stop_event.wait(wait_time):
             break
-        if not _press_f15(user32, stop_event):
+        if not _press_cluster(user32, stop_event):
             break
         completed += 1
         next_press_time += interval
     return completed
+
+
+add_burst_clicks = add_f15_clicks

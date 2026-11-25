@@ -20,6 +20,9 @@ class FakeApi:
         self.clock = Clock()
         self.calls = []
         self.fail = None
+        self.fail_seq = []
+        self.bump_on_fail = 0
+        self.stale = None
         self.info = {
             'cuid': 'a',
             'total_click_count': 5000,
@@ -29,10 +32,15 @@ class FakeApi:
         }
 
     def me(self):
-        return dict(self.info)
+        # `stale` simulates /user/me still serving the pre-claim snapshot.
+        return dict(self.stale if self.stale is not None else self.info)
 
     def open(self, slot, gross):
         self.calls.append((slot, gross))
+        if self.fail_seq:
+            # Simulate Tappo reporting more clicks while the claim was in flight.
+            self.info['total_click_count'] += self.bump_on_fail
+            raise self.fail_seq.pop(0)
         if self.fail:
             raise self.fail
         self.info['total_click_consume'] += 1000
@@ -117,6 +125,110 @@ class Tests(unittest.TestCase):
         self.assertEqual(engine.step(), 30)
         engine.step()
         self.assertEqual(len(api.calls), 1)
+
+    def test_sends_live_tappo_click_count_when_it_is_ahead_of_server(self):
+        api = FakeApi(-1, 100)
+        Engine(api, self.path, click_source=lambda: 5007).step()
+        self.assertEqual(api.calls, [('left', 5007)])
+
+    def test_ignores_unusable_live_click_counts(self):
+        for live in (None, 4999, 5000 + 10_000_000, True, 5001.5, 'x'):
+            with self.subTest(live=live):
+                api = FakeApi(-1, 100)
+                with tempfile.TemporaryDirectory() as tmp:
+                    Engine(api, Path(tmp) / 'j.json', click_source=lambda live=live: live).step()
+                self.assertEqual(api.calls, [('left', 5000)])
+
+    def test_failing_click_source_falls_back_to_server_count(self):
+        def broken():
+            raise RuntimeError('cdp unavailable')
+        api = FakeApi(-1, 100)
+        Engine(api, self.path, click_source=broken).step()
+        self.assertEqual(api.calls, [('left', 5000)])
+
+    def test_invalid_click_count_is_retried_at_once_with_fresh_totals(self):
+        api = FakeApi(-1, 100)
+        api.fail_seq = [ApiError(70003)]
+        api.bump_on_fail = 40
+        sleeps = []
+        engine = Engine(api, self.path, sleep=sleeps.append)
+        self.assertEqual(engine.step(), 2)
+        self.assertEqual(api.calls, [('left', 5000), ('left', 5040)])
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual(engine.attempts['left']['outcome'], 'success')
+
+    def test_invalid_click_count_gives_up_after_bounded_retries(self):
+        api = FakeApi(-1, 100)
+        api.fail = ApiError(70003)
+        sleeps = []
+        engine = Engine(api, self.path, sleep=sleeps.append)
+        self.assertEqual(engine.step(), 30)
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(len(sleeps), 2)
+        self.assertEqual(engine.attempts['left']['outcome'], 'rejected')
+        engine.step()
+        self.assertEqual(len(api.calls), 3)
+
+    def test_other_rejections_are_not_retried_in_place(self):
+        api = FakeApi(-1, 100)
+        api.fail = ApiError(70006)
+        sleeps = []
+        Engine(api, self.path, sleep=sleeps.append).step()
+        self.assertEqual(len(api.calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def _statuses(self, events):
+        return [kw for name, kw in events if name == 'status']
+
+    def test_countdown_runs_while_user_me_still_serves_pre_claim_deadline(self):
+        api = FakeApi(-1, 100)
+        events = []
+        engine = Engine(api, self.path, lambda n, **kw: events.append((n, kw)))
+        api.stale = dict(api.info)
+        engine.step()
+        self.assertEqual(api.calls, [('left', 5000)])
+        api.clock.value += 2
+        events.clear()
+        engine.step()
+        status = self._statuses(events)[0]
+        self.assertAlmostEqual(status['left'], 1798, delta=1)
+        self.assertAlmostEqual(status['right'], 98, delta=1)
+        self.assertEqual(len(api.calls), 1)
+
+    def test_countdown_survives_restart_while_user_me_is_stale(self):
+        api = FakeApi(-1, 100)
+        Engine(api, self.path).step()
+        api.stale = {**api.info,
+                     'left_treasure_chest': (NOW - 1) * 1000}
+        api.clock.value += 5
+        events = []
+        Engine(api, self.path, lambda n, **kw: events.append((n, kw))).step()
+        self.assertAlmostEqual(self._statuses(events)[0]['left'], 1795, delta=1)
+        self.assertEqual(len(api.calls), 1)
+
+    def test_fresh_user_me_deadline_replaces_the_estimate(self):
+        api = FakeApi(-1, 100)
+        engine = Engine(api, self.path)
+        api.stale = dict(api.info)
+        engine.step()
+        api.stale = None
+        api.info['left_treasure_chest'] = (api.clock.now() + 1790) * 1000
+        events = []
+        engine.emit = lambda n, **kw: events.append((n, kw))
+        engine.step()
+        self.assertAlmostEqual(self._statuses(events)[0]['left'], 1790, delta=1)
+
+    def test_estimate_is_ignored_once_it_has_expired(self):
+        api = FakeApi(-1, 100)
+        engine = Engine(api, self.path)
+        stale = dict(api.info)
+        api.stale = stale
+        engine.step()
+        api.clock.value += 1801
+        events = []
+        engine.emit = lambda n, **kw: events.append((n, kw))
+        engine.step()
+        self.assertEqual(self._statuses(events)[0]['left'], 0)
 
     def test_account_change_stops_claim(self):
         api = FakeApi(-1, -1)
